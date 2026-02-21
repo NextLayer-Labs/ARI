@@ -27,6 +27,26 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
+        <nav className="border-b border-gray-200 dark:border-gray-700 px-6 py-3 flex gap-4">
+          <a
+            href="/"
+            className="text-sm font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+          >
+            Home
+          </a>
+          <a
+            href="/runs"
+            className="text-sm font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+          >
+            Runs
+          </a>
+          <a
+            href="/pipeline-versions"
+            className="text-sm font-medium text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+          >
+            Pipeline versions
+          </a>
+        </nav>
         {children}
       </body>
     </html>

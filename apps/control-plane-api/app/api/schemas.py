@@ -61,6 +61,7 @@ class PipelineVersionOut(BaseModel):
     version: str
     status: str
     dag_spec: dict[str, Any]
+    created_at: Optional[str] = None  # ISO with timezone when returned from GET/list
 
 class ApproveVersionIn(BaseModel):
     status: str  # "APPROVED" or "DEPRECATED"

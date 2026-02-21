@@ -266,6 +266,9 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/pipelines` - Create pipeline
 - `POST /api/pipeline-versions` - Create pipeline version (status: DRAFT)
 - `POST /api/pipeline-versions/{id}/status` - Update version status (APPROVED/DEPRECATED/DRAFT)
+- `GET /api/pipeline-versions` - List pipeline versions (filters: tenant_id, pipeline_id, status; limit/offset)
+- `GET /api/pipeline-versions/{id}` - Get pipeline version by ID (includes dag_spec)
+- `GET /api/pipelines` - List pipelines (optional tenant_id; limit/offset)
 
 #### Run Lifecycle Endpoints (`/api/runs/*`)
 
@@ -484,6 +487,18 @@ The dashboard will be available at `http://localhost:3000`
   - Error message (if FAILED)
 - Link back to runs list
 - Fetches data on mount (no auto-refresh)
+
+#### `/pipeline-versions` - Pipeline Versions List
+
+- Table of pipeline versions with version ID, status badge, version string, pipeline (name or ID), tenant ID, created_at
+- Filters: status (All/DRAFT/APPROVED/DEPRECATED), tenant_id, pipeline_id (apply on submit)
+- Pagination: Prev/Next with limit/offset and total
+- Per-row actions: Approve (when DRAFT), Deprecate (when APPROVED); buttons disable while in-flight and list refreshes on success
+
+#### `/pipeline-versions/[id]` - Pipeline Version Detail
+
+- Full version details including dag_spec (collapsible JSON)
+- Back link to list; same Approve/Deprecate actions as list page
 
 ### Features
 
@@ -777,6 +792,8 @@ $approveBody = @{
 $approvedVersion = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/pipeline-versions/$versionId/status" -ContentType "application/json" -Body $approveBody
 Write-Host "Approved pipeline version: $($approvedVersion.status)" -ForegroundColor Green
 ```
+
+**Quick seed for Pipeline Versions UI (dashboard):** To test the Pipeline Versions list and Approve/Deprecate UI at `http://localhost:3000/pipeline-versions`, run only the "Create a Tenant", "Create a Pipeline", and "Create a Pipeline Version (DRAFT)" blocks above (do not approve). Then open `/pipeline-versions` and use the Approve button; optionally Deprecate afterward.
 
 ### Step 2: Create a Run
 
@@ -1353,6 +1370,8 @@ GET /api/runs?status=QUEUED&limit=10&offset=0
 **Document Version:** 1.0  
 **Last Updated:** February 2026  
 **Maintained by:** NextLayer Team
-#   A R I  
- #   A R I  
+#   A R I 
+ 
+ #   A R I 
+ 
  
