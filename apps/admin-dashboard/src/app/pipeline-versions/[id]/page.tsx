@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import { TriggerRunButton } from "@/components/TriggerRunButton";
 
 const CP_BASE =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_CP_BASE) ||
@@ -273,13 +274,21 @@ export default function PipelineVersionDetailPage({
               Approve
             </button>
           ) : v.status === "APPROVED" ? (
-            <button
-              type="button"
-              onClick={() => setStatus("DEPRECATED")}
-              className="px-3 py-1.5 text-sm font-medium rounded bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-800"
-            >
-              Deprecate
-            </button>
+            <>
+              <TriggerRunButton
+                tenantId={v.tenant_id}
+                pipelineVersionId={v.id}
+                label="Trigger run"
+                className="px-3 py-1.5 text-sm font-medium rounded bg-blue-200 text-blue-800 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-300 dark:hover:bg-blue-800"
+              />
+              <button
+                type="button"
+                onClick={() => setStatus("DEPRECATED")}
+                className="px-3 py-1.5 text-sm font-medium rounded bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-800"
+              >
+                Deprecate
+              </button>
+            </>
           ) : (
             <span className="text-gray-500 text-sm">No actions for {v.status}</span>
           )}

@@ -493,12 +493,16 @@ The dashboard will be available at `http://localhost:3000`
 - Table of pipeline versions with version ID, status badge, version string, pipeline (name or ID), tenant ID, created_at
 - Filters: status (All/DRAFT/APPROVED/DEPRECATED), tenant_id, pipeline_id (apply on submit)
 - Pagination: Prev/Next with limit/offset and total
-- Per-row actions: Approve (when DRAFT), Deprecate (when APPROVED); buttons disable while in-flight and list refreshes on success
+- Per-row actions: Approve (when DRAFT), **Run** and Deprecate (when APPROVED); buttons disable while in-flight and list refreshes on success
 
 #### `/pipeline-versions/[id]` - Pipeline Version Detail
 
 - Full version details including dag_spec (collapsible JSON)
-- Back link to list; same Approve/Deprecate actions as list page
+- Back link to list; same Approve/Deprecate actions as list page; **Trigger run** when APPROVED
+
+#### How to trigger a run from the UI
+
+You can create a manual run (QUEUED) from the dashboard without using PowerShell. On the **Pipeline Versions** list (`/pipeline-versions`) or on a version’s detail page (`/pipeline-versions/[id]`), for any **APPROVED** version click **Run** (list) or **Trigger run** (detail). A modal opens: enter **parameters** as a JSON object (e.g. `{}` or `{"key": "value"}`). Parameters must be valid JSON and must be an object (not an array or primitive). Click **Create run**; on success you are redirected to `/runs/[id]` where you can watch status and logs. The worker will claim and execute the run as usual.
 
 ### Features
 

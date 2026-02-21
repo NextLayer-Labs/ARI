@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
+import { TriggerRunButton } from "@/components/TriggerRunButton";
 
 const CP_BASE =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_CP_BASE) ||
@@ -260,13 +261,20 @@ export default function PipelineVersionsPage() {
                           Approve
                         </button>
                       ) : pv.status === "APPROVED" ? (
-                        <button
-                          type="button"
-                          onClick={() => setStatus(pv.id, "DEPRECATED")}
-                          className="px-2 py-1 text-xs font-medium rounded bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-800"
-                        >
-                          Deprecate
-                        </button>
+                        <span className="flex items-center gap-2 flex-wrap">
+                          <TriggerRunButton
+                            tenantId={pv.tenant_id}
+                            pipelineVersionId={pv.id}
+                            label="Run"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setStatus(pv.id, "DEPRECATED")}
+                            className="px-2 py-1 text-xs font-medium rounded bg-amber-200 text-amber-800 dark:bg-amber-900 dark:text-amber-200 hover:bg-amber-300 dark:hover:bg-amber-800"
+                          >
+                            Deprecate
+                          </button>
+                        </span>
                       ) : (
                         "—"
                       )}
