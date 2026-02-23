@@ -251,5 +251,7 @@ def create_run(body: RunCreate, db: Session = Depends(get_db)):
         id=run.id, tenant_id=run.tenant_id,
         pipeline_version_id=run.pipeline_version_id,
         status=run.status, trigger_type=run.trigger_type,
-        parameters=run.parameters
+        parameters=run.parameters,
+        retry_of_run_id=getattr(run, "retry_of_run_id", None),
+        root_run_id=getattr(run, "root_run_id", None),
     )

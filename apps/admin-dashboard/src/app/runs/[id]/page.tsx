@@ -24,6 +24,8 @@ type RunDetail = {
   created_at: string | null;
   updated_at: string | null;
   pipeline_id?: string;
+  retry_of_run_id?: string | null;
+  root_run_id?: string | null;
 };
 
 type DetailResponse = { found: boolean; run?: RunDetail; reason?: string };
@@ -101,6 +103,9 @@ export default function RunDetailPage({
   const [logsError, setLogsError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
   const [actionFeedback, setActionFeedback] = useState<{ ok: boolean; message: string } | null>(null);
+  const [retryChildren, setRetryChildren] = useState<RunDetail[]>([]);
+  const [retryChildrenError, setRetryChildrenError] = useState<string | null>(null);
+  const [retryChildrenFetched, setRetryChildrenFetched] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const logsScrollRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
@@ -188,6 +193,25 @@ export default function RunDetailPage({
     const interval = setInterval(() => fetchLogs(id), 2000);
     return () => clearInterval(interval);
   }, [id, run?.status, fetchLogs]);
+
+  // Fetch child retries (runs created from this run) for "Retries" section
+  useEffect(() => {
+    if (!id) return;
+    setRetryChildrenFetched(false);
+    const url = `${CP_BASE}/api/runs?retry_of_run_id=${encodeURIComponent(id)}&limit=50&offset=0`;
+    fetch(url)
+      .then((res) => res.json())
+      .then((data: { items?: RunDetail[] }) => {
+        setRetryChildren(Array.isArray(data.items) ? data.items : []);
+        setRetryChildrenError(null);
+        setRetryChildrenFetched(true);
+      })
+      .catch(() => {
+        setRetryChildren([]);
+        setRetryChildrenError("Could not load retries");
+        setRetryChildrenFetched(true);
+      });
+  }, [id]);
 
   const handleCancel = useCallback(async () => {
     if (!id) return;
@@ -330,8 +354,55 @@ export default function RunDetailPage({
           <dd className="font-mono break-all" title={r.pipeline_version_id}>
             {shortId(r.pipeline_version_id)} — {r.pipeline_version_id}
           </dd>
+          {r.retry_of_run_id != null && r.retry_of_run_id !== "" && (
+            <>
+              <dt className="text-gray-500 dark:text-gray-400">Retry of</dt>
+              <dd>
+                <Link
+                  href={`/runs/${r.retry_of_run_id}`}
+                  className="font-mono text-blue-600 dark:text-blue-400 hover:underline"
+                  title={r.retry_of_run_id}
+                >
+                  {shortId(r.retry_of_run_id)}
+                </Link>
+              </dd>
+            </>
+          )}
         </dl>
       </section>
+
+      {/* Retries (child runs created from this run) */}
+      {retryChildrenFetched && (
+        <section className="mb-6">
+          <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+            Retries
+          </h2>
+          {retryChildrenError ? (
+            <p className="text-sm text-amber-600 dark:text-amber-400">{retryChildrenError}</p>
+          ) : retryChildren.length === 0 ? (
+            <p className="text-sm text-gray-500">No retries yet.</p>
+          ) : (
+            <ul className="list-disc list-inside text-sm space-y-1">
+              {retryChildren.map((child) => (
+                <li key={child.id}>
+                  <Link
+                    href={`/runs/${child.id}`}
+                    className="font-mono text-blue-600 dark:text-blue-400 hover:underline"
+                    title={child.id}
+                  >
+                    {shortId(child.id)}
+                  </Link>
+                  {child.status != null && child.status !== "" && (
+                    <span className="ml-2">
+                      <span className={statusBadgeClass(child.status)}>{child.status}</span>
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
 
       {/* Status */}
       <section className="mb-6">

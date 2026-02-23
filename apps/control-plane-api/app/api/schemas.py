@@ -79,6 +79,8 @@ class RunOut(BaseModel):
     status: str
     trigger_type: str
     parameters: dict[str, Any]
+    retry_of_run_id: Optional[str] = None
+    root_run_id: Optional[str] = None
 
 
 class RunClaimIn(BaseModel):

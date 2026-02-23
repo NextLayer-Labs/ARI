@@ -163,6 +163,7 @@ def complete_run(run_id: str, body: RunCompleteIn, db: Session = Depends(get_db)
 def list_runs(
     tenant_id: str | None = None,
     status: str | None = None,
+    retry_of_run_id: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -178,17 +179,22 @@ def list_runs(
         where.append("status = CAST(:status AS VARCHAR)")
         params["status"] = status
 
+    if retry_of_run_id is not None:
+        where.append("retry_of_run_id = :retry_of_run_id")
+        params["retry_of_run_id"] = str(retry_of_run_id)
+
     sql = text(f"""
 SELECT id, tenant_id, pipeline_version_id, status, trigger_type, parameters,
        claimed_by, claimed_at, started_at, finished_at, heartbeat_at, error_message,
-       created_at, updated_at
+       created_at, updated_at,
+       retry_of_run_id, root_run_id
 FROM pipeline_runs
 WHERE {" AND ".join(where)}
 ORDER BY created_at DESC
 LIMIT :limit OFFSET :offset
 """)
     rows = db.execute(sql, params).mappings().all()
-    return {"items": [dict(r) for r in rows], "limit": limit, "offset": offset, "count": len(rows)}
+    return {"items": [_serialize_run(dict(r)) for r in rows], "limit": limit, "offset": offset, "count": len(rows)}
 
 
 @router.get("/{run_id}")
@@ -198,7 +204,8 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
             """
             SELECT id, tenant_id, pipeline_version_id, status, trigger_type, parameters,
                    claimed_by, claimed_at, started_at, finished_at, heartbeat_at, error_message,
-                   created_at, updated_at
+                   created_at, updated_at,
+                   retry_of_run_id, root_run_id
             FROM pipeline_runs
             WHERE id = :run_id
             """
@@ -210,7 +217,7 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
             status_code=404,
             content={"found": False, "reason": "run_not_found"},
         )
-    return {"found": True, "run": dict(row)}
+    return {"found": True, "run": _serialize_run(dict(row))}
 
 
 def _run_exists(db: Session, run_id: str) -> dict | None:
@@ -227,7 +234,8 @@ def _get_run_full(db: Session, run_id: str) -> dict | None:
             """
             SELECT id, tenant_id, pipeline_version_id, status, trigger_type, parameters,
                    claimed_by, claimed_at, started_at, finished_at, heartbeat_at, error_message,
-                   created_at, updated_at
+                   created_at, updated_at,
+                   retry_of_run_id, root_run_id
             FROM pipeline_runs
             WHERE id = :run_id
             """
@@ -323,12 +331,15 @@ def retry_run(run_id: str, body: RetryIn | None = None, db: Session = Depends(ge
     parameters = run["parameters"] if run.get("parameters") is not None else {}
     if body is not None and body.parameters is not None:
         parameters = body.parameters
+    root_run_id = run.get("root_run_id") if run.get("root_run_id") else run_id
     new_run = PipelineRun(
         tenant_id=run["tenant_id"],
         pipeline_version_id=run["pipeline_version_id"],
         trigger_type="retry",
         parameters=parameters,
         status="QUEUED",
+        retry_of_run_id=run_id,
+        root_run_id=root_run_id,
     )
     db.add(new_run)
     db.commit()

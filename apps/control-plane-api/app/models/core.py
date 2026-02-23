@@ -76,9 +76,16 @@ class PipelineRun(Base):
     tenant_id: Mapped[str] = mapped_column(String(36), ForeignKey("tenants.id"), nullable=False)
     pipeline_version_id: Mapped[str] = mapped_column(String(36), ForeignKey("pipeline_versions.id"), nullable=False)
 
-    status: Mapped[str] = mapped_column(String(30), nullable=False, default="QUEUED")  # QUEUED/RUNNING/SUCCEEDED/FAILED
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="QUEUED")  # QUEUED/RUNNING/SUCCEEDED/FAILED/CANCELLED
     trigger_type: Mapped[str] = mapped_column(String(30), nullable=False, default="manual")
     parameters: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+    retry_of_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("pipeline_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    root_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("pipeline_runs.id", ondelete="SET NULL"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -88,6 +95,13 @@ class PipelineRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+
+    retry_of_run = relationship(
+        "PipelineRun", remote_side=[id], foreign_keys=[retry_of_run_id], uselist=False
+    )
+    root_run = relationship(
+        "PipelineRun", remote_side=[id], foreign_keys=[root_run_id], uselist=False
+    )
 
 
 class PipelineRunLog(Base):

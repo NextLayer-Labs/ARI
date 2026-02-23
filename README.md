@@ -244,9 +244,11 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `id` (UUID string, primary key)
 - `tenant_id` (foreign key to tenants)
 - `pipeline_version_id` (foreign key to pipeline_versions)
-- `status` (string: QUEUED/RUNNING/SUCCEEDED/FAILED)
+- `status` (string: QUEUED/RUNNING/SUCCEEDED/FAILED/CANCELLED)
 - `trigger_type` (string, default: "manual")
 - `parameters` (JSON)
+- `retry_of_run_id` (UUID string, nullable, FK to pipeline_runs.id) — set when run was created via Retry
+- `root_run_id` (UUID string, nullable, FK to pipeline_runs.id) — root of retry chain for grouping
 - `created_at` (timestamptz)
 - `started_at` (timestamptz, nullable)
 - `claimed_at` (timestamptz, nullable)
@@ -277,8 +279,10 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/runs/{id}/complete` - Transition RUNNING → SUCCEEDED/FAILED
 - `POST /api/runs/{id}/cancel` - Cancel run (QUEUED or RUNNING → CANCELLED; writes WARN log)
 - `POST /api/runs/{id}/retry` - Create new QUEUED run from FAILED/CANCELLED (optional body: `{ "parameters": { ... } }`)
-- `GET /api/runs/{id}` - Get run details
-- `GET /api/runs` - List runs with filters and pagination (status filter includes CANCELLED)
+- `GET /api/runs/{id}` - Get run details (includes retry_of_run_id, root_run_id when set)
+- `GET /api/runs` - List runs with filters and pagination (query params: tenant_id, status, retry_of_run_id; status includes CANCELLED)
+
+**Retry lineage:** Runs created via Retry store `retry_of_run_id` (parent run) and `root_run_id` (root of the retry chain). The dashboard run detail page shows “Retry of” (link to parent) and “Retries” (child runs). Use `GET /api/runs?retry_of_run_id=<run_id>` to list child retries.
 
 ### Dynamic WHERE Clause Implementation
 
@@ -328,6 +332,8 @@ alembic current
 - `f1e1d445c1d4_init_core_tables.py` - Initial schema
 - `3f1739d6108c_add_pipeline_run_lifecycle_columns.py` - Added claimed_at, claimed_by, heartbeat_at, error_message, updated_at
 - `a1b2c3d4e5f6_pipeline_runs_timestamptz.py` - Converted timestamps to timestamptz
+- `b2c3d4e5f6a7_add_pipeline_run_logs.py` - pipeline_run_logs table
+- `c4d5e6f7a8b9_add_retry_lineage_columns.py` - retry_of_run_id, root_run_id on pipeline_runs (indexes + FKs)
 
 ---
 
@@ -484,11 +490,13 @@ The dashboard will be available at `http://localhost:3000`
 
 - Displays full run details:
   - All run fields (ID, status, tenant, pipeline version, etc.)
+  - **Retry lineage**: If this run was created via Retry, shows “Retry of: \<link to parent run\>”; a “Retries” section lists child runs (created by retrying this run) with links to each
   - Timestamps formatted in local timezone
   - Parameters JSON (if present)
   - Error message (if FAILED)
+- Actions: Cancel (QUEUED/RUNNING), Retry (FAILED/CANCELLED)
 - Link back to runs list
-- Fetches data on mount (no auto-refresh)
+- Fetches data on mount; polls status/logs until terminal; fetches child retries for lineage
 
 #### `/pipeline-versions` - Pipeline Versions List
 
