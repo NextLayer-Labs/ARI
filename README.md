@@ -55,7 +55,7 @@ NextLayer MVP is a monorepo implementing a control plane/data plane architecture
 
 Pipeline runs progress through the following states:
 
-```
+```text
 QUEUED → RUNNING → SUCCEEDED/FAILED
 ```
 
@@ -75,7 +75,7 @@ QUEUED → RUNNING → SUCCEEDED/FAILED
 
 ## Repository Structure
 
-```
+```text
 NextLayer/
 ├── apps/
 │   ├── control-plane-api/          # FastAPI application
