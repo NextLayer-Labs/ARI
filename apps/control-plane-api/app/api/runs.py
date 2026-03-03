@@ -6,7 +6,16 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.api.schemas import LogAppendIn, RunClaimIn, RunCompleteIn, RetryIn, HeartbeatIn, ReapStaleIn
+from app.api.schemas import (
+    LogAppendIn,
+    RawIngestCreateIn,
+    RunArtifactCreateIn,
+    RunClaimIn,
+    RunCompleteIn,
+    RetryIn,
+    HeartbeatIn,
+    ReapStaleIn,
+)
 from app.db.deps import get_db
 from app.models.core import PipelineRun, PipelineVersion
 
@@ -354,6 +363,13 @@ def _serialize_run(r: dict) -> dict:
     return out
 
 
+def _serialize_artifact(a: dict) -> dict:
+    out = dict(a)
+    if out.get("created_at") is not None and hasattr(out["created_at"], "isoformat"):
+        out["created_at"] = out["created_at"].isoformat()
+    return out
+
+
 @router.post("/{run_id}/cancel")
 def cancel_run(run_id: str, db: Session = Depends(get_db)):
     run = _get_run_full(db, run_id)
@@ -545,3 +561,128 @@ def get_run_logs(
             row_dict["ts"] = row_dict["ts"].isoformat()
         logs.append(row_dict)
     return {"found": True, "run_id": run_id, "logs": logs}
+
+
+@router.post("/{run_id}/raw-ingests")
+def create_run_raw_ingest(run_id: str, body: RawIngestCreateIn, db: Session = Depends(get_db)):
+    run = _run_exists(db, run_id)
+    if run is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "run_not_found"},
+        )
+    if not isinstance(body.payload, dict):
+        raise HTTPException(status_code=400, detail="payload_must_be_object")
+    payload_json = json.dumps(body.payload)
+    row = db.execute(
+        text(
+            """
+            INSERT INTO pipeline_run_raw_ingests (
+                id, run_id, tenant_id, facility_id, provider, mapping_version, fetched_at, as_of, payload
+            )
+            VALUES (
+                gen_random_uuid()::text,
+                :run_id,
+                :tenant_id,
+                :facility_id,
+                :provider,
+                :mapping_version,
+                NOW(),
+                CAST(:as_of AS timestamptz),
+                CAST(:payload AS jsonb)
+            )
+            RETURNING id, run_id, tenant_id, facility_id, provider, mapping_version, fetched_at, as_of, payload
+            """
+        ),
+        {
+            "run_id": run_id,
+            "tenant_id": run["tenant_id"],
+            "facility_id": body.facility_id,
+            "provider": body.provider,
+            "mapping_version": body.mapping_version,
+            "as_of": body.as_of,
+            "payload": payload_json,
+        },
+    ).mappings().one()
+    db.commit()
+    out = dict(row)
+    for key in ("fetched_at", "as_of"):
+        if out.get(key) is not None and hasattr(out[key], "isoformat"):
+            out[key] = out[key].isoformat()
+    return {"ok": True, "raw_ingest": out}
+
+
+@router.post("/{run_id}/artifacts")
+def create_run_artifact(run_id: str, body: RunArtifactCreateIn, db: Session = Depends(get_db)):
+    run = _run_exists(db, run_id)
+    if run is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "run_not_found"},
+        )
+    if not isinstance(body.payload, dict):
+        raise HTTPException(status_code=400, detail="payload_must_be_object")
+    payload_json = json.dumps(body.payload)
+    meta_json = json.dumps(body.meta) if body.meta is not None else None
+    row = db.execute(
+        text(
+            """
+            INSERT INTO pipeline_run_artifacts (id, run_id, tenant_id, created_at, artifact_type, payload, source, meta)
+            VALUES (
+                gen_random_uuid()::text,
+                :run_id,
+                :tenant_id,
+                NOW(),
+                :artifact_type,
+                CAST(:payload AS jsonb),
+                :source,
+                CAST(:meta AS jsonb)
+            )
+            RETURNING id, run_id, tenant_id, created_at, artifact_type, payload, source, meta
+            """
+        ),
+        {
+            "run_id": run_id,
+            "tenant_id": run["tenant_id"],
+            "artifact_type": body.artifact_type,
+            "payload": payload_json,
+            "source": body.source,
+            "meta": meta_json,
+        },
+    ).mappings().one()
+    db.commit()
+    return {"ok": True, "artifact": _serialize_artifact(dict(row))}
+
+
+@router.get("/{run_id}/artifacts")
+def get_run_artifacts(
+    run_id: str,
+    artifact_type: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    order: str = Query("asc"),
+    db: Session = Depends(get_db),
+):
+    run = _run_exists(db, run_id)
+    if run is None:
+        return JSONResponse(
+            status_code=404,
+            content={"found": False, "reason": "run_not_found"},
+        )
+    order_dir = "DESC" if order.lower() == "desc" else "ASC"
+    params: dict = {"run_id": run_id, "limit": limit}
+    conditions = ["run_id = :run_id"]
+    if artifact_type is not None:
+        conditions.append("artifact_type = :artifact_type")
+        params["artifact_type"] = artifact_type
+    sql = text(
+        f"""
+        SELECT id, run_id, tenant_id, created_at, artifact_type, payload, source, meta
+        FROM pipeline_run_artifacts
+        WHERE {" AND ".join(conditions)}
+        ORDER BY created_at {order_dir}
+        LIMIT :limit
+        """
+    )
+    rows = db.execute(sql, params).mappings().all()
+    items = [_serialize_artifact(dict(r)) for r in rows]
+    return {"items": items, "count": len(items), "limit": limit}

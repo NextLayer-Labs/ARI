@@ -258,6 +258,16 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `error_message` (text, nullable)
 - `updated_at` (timestamptz)
 
+#### PipelineRunArtifact
+- `id` (UUID string, primary key)
+- `run_id` (UUID string, foreign key to pipeline_runs, `ON DELETE CASCADE`)
+- `tenant_id` (UUID string, denormalized; matches pipeline_runs.tenant_id)
+- `created_at` (timestamptz)
+- `artifact_type` (string, e.g., "inventory_summary", "raw_ingest_ref")
+- `payload` (JSON object; arbitrary artifact payload)
+- `source` (text, nullable; e.g., "data-plane-worker", "control-plane")
+- `meta` (JSON, nullable; small metadata blob)
+
 ### Key Endpoints
 
 #### Registry Endpoints (`/api/*`)
@@ -283,6 +293,8 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/runs/reap-stale` - Mark stale RUNNING runs as FAILED (body: `{ "stale_after_seconds": 300, "limit": 100 }` optional)
 - `GET /api/runs/{id}` - Get run details (includes retry_of_run_id, root_run_id, heartbeat_at when set)
 - `GET /api/runs` - List runs with filters and pagination (query params: tenant_id, status, retry_of_run_id; status includes CANCELLED)
+ - `POST /api/runs/{id}/artifacts` - Create a JSON artifact for a run (e.g., inventory summary)
+ - `GET /api/runs/{id}/artifacts` - List artifacts for a run (optional filters: artifact_type, limit, order)
 
 **Retry lineage:** Runs created via Retry store `retry_of_run_id` (parent run) and `root_run_id` (root of the retry chain). The dashboard run detail page shows “Retry of” (link to parent) and “Retries” (child runs). Use `GET /api/runs?retry_of_run_id=<run_id>` to list child retries.
 
@@ -1235,6 +1247,85 @@ GET /api/runs?status=QUEUED&limit=10&offset=0
   "limit": 20,
   "offset": 0,
   "count": 1
+}
+```
+
+#### POST /api/runs/{id}/artifacts
+
+Create a new artifact row associated with a pipeline run. The artifact inherits its tenant from the run.
+
+**Request Body:**
+```json
+{
+  "artifact_type": "inventory_summary",
+  "payload": {
+    "items_total": 120,
+    "out_of_stock": 7
+  },
+  "source": "data-plane-worker",
+  "meta": {
+    "note": "example artifact"
+  }
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "ok": true,
+  "artifact": {
+    "id": "uuid",
+    "run_id": "uuid",
+    "tenant_id": "uuid",
+    "created_at": "2026-02-24T22:05:00+00:00",
+    "artifact_type": "inventory_summary",
+    "payload": {
+      "items_total": 120,
+      "out_of_stock": 7
+    },
+    "source": "data-plane-worker",
+    "meta": {
+      "note": "example artifact"
+    }
+  }
+}
+```
+
+**Errors:**
+- `404 Not Found`: Run not found
+- `400 Bad Request`: `payload` is not a JSON object (must be an object, not array/primitive)
+
+#### GET /api/runs/{id}/artifacts
+
+List artifacts for a run.
+
+**Query Parameters:**
+- `artifact_type` (optional): Filter by artifact type (e.g., `inventory_summary`)
+- `limit` (optional, default: 50, max: 200): Max artifacts to return
+- `order` (optional, default: `asc`): `asc` or `desc` by `created_at`
+
+**Response:** `200 OK`
+```json
+{
+  "items": [
+    {
+      "id": "uuid",
+      "run_id": "uuid",
+      "tenant_id": "uuid",
+      "created_at": "2026-02-24T22:05:00+00:00",
+      "artifact_type": "inventory_summary",
+      "payload": {
+        "items_total": 120,
+        "out_of_stock": 7
+      },
+      "source": "data-plane-worker",
+      "meta": {
+        "note": "example artifact"
+      }
+    }
+  ],
+  "count": 1,
+  "limit": 50
 }
 ```
 

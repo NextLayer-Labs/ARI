@@ -109,6 +109,18 @@ export default function RunDetailPage({
   const logsScrollRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
 
+  type InventorySummary = {
+    facility_id: string;
+    provider: string;
+    as_of: string | null;
+    items_total: number;
+    out_of_stock: number;
+    out_of_stock_skus_sample: string[];
+  } | null;
+
+  const [inventorySummary, setInventorySummary] = useState<InventorySummary>(null);
+  const [inventorySummaryError, setInventorySummaryError] = useState<string | null>(null);
+
   const fetchRun = useCallback(async (runId: string) => {
     const url = `${CP_BASE}/api/runs/${runId}`;
     const res = await fetch(url);
@@ -192,6 +204,42 @@ export default function RunDetailPage({
     const interval = setInterval(() => fetchLogs(id), 2000);
     return () => clearInterval(interval);
   }, [id, run?.status, fetchLogs]);
+
+  // Fetch latest inventory summary artifact (if any)
+  useEffect(() => {
+    if (!id) return;
+    const url = `${CP_BASE}/api/runs/${id}/artifacts?artifact_type=inventory_summary&order=desc&limit=1`;
+    fetch(url)
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
+      })
+      .then((data: { items?: { payload?: any }[] }) => {
+        const artifact = Array.isArray(data.items) && data.items.length > 0 ? data.items[0] : null;
+        if (artifact && artifact.payload && typeof artifact.payload === "object") {
+          const p = artifact.payload as any;
+          setInventorySummary({
+            facility_id: String(p.facility_id ?? ""),
+            provider: String(p.provider ?? ""),
+            as_of: typeof p.as_of === "string" ? p.as_of : null,
+            items_total: Number(p.items_total ?? 0),
+            out_of_stock: Number(p.out_of_stock ?? 0),
+            out_of_stock_skus_sample: Array.isArray(p.out_of_stock_skus_sample)
+              ? (p.out_of_stock_skus_sample as string[])
+              : [],
+          });
+          setInventorySummaryError(null);
+        } else {
+          setInventorySummary(null);
+        }
+      })
+      .catch(() => {
+        setInventorySummary(null);
+        setInventorySummaryError("Could not load inventory summary");
+      });
+  }, [id]);
 
   // Fetch child retries (runs created from this run) for "Retries" section
   useEffect(() => {
@@ -456,6 +504,52 @@ export default function RunDetailPage({
             </>
           )}
         </dl>
+      </section>
+
+      {/* Inventory Summary */}
+      <section className="mb-6">
+        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Inventory Summary
+        </h2>
+        {inventorySummaryError && (
+          <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{inventorySummaryError}</p>
+        )}
+        {!inventorySummary && !inventorySummaryError ? (
+          <p className="text-sm text-gray-500">No inventory summary for this run yet.</p>
+        ) : inventorySummary ? (
+          <div className="rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 p-3 text-sm space-y-1">
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Facility:</span>{" "}
+              <span className="font-mono break-all">{inventorySummary.facility_id || "—"}</span>
+            </div>
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Provider:</span>{" "}
+              <span className="font-mono">{inventorySummary.provider || "—"}</span>
+            </div>
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">As of:</span>{" "}
+              <span>{inventorySummary.as_of ? formatDate(inventorySummary.as_of) : "—"}</span>
+            </div>
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Items total:</span>{" "}
+              <span className="font-mono">{inventorySummary.items_total}</span>
+            </div>
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Out of stock:</span>{" "}
+              <span className="font-mono">{inventorySummary.out_of_stock}</span>
+            </div>
+            <div>
+              <span className="text-gray-500 dark:text-gray-400">Sample OOS SKUs:</span>{" "}
+              {inventorySummary.out_of_stock_skus_sample.length === 0 ? (
+                <span className="font-mono text-gray-500">—</span>
+              ) : (
+                <span className="font-mono">
+                  {inventorySummary.out_of_stock_skus_sample.join(", ")}
+                </span>
+              )}
+            </div>
+          </div>
+        ) : null}
       </section>
 
       {/* Error callout */}

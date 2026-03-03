@@ -2,8 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router as api_router
-from app.settings import settings
 from app.api.runs import router as runs_router
+from app.api.inventory import router as inventory_router
+from app.settings import settings
 
 app = FastAPI(title="NextLayer Control Plane", version="0.1.0")
 
@@ -23,4 +24,5 @@ def health():
 
 app.include_router(api_router, prefix="/api")
 app.include_router(runs_router)
+app.include_router(inventory_router)
 

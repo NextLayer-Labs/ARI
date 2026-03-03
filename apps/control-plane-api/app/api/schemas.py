@@ -120,3 +120,63 @@ class LogEntryOut(BaseModel):
     message: str
     source: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
+
+
+class RunArtifactCreateIn(BaseModel):
+    artifact_type: str
+    payload: Any  # validated in route to be a JSON object
+    source: Optional[str] = None
+    meta: Optional[dict[str, Any]] = None
+
+
+class RunArtifactOut(BaseModel):
+    id: str
+    run_id: str
+    tenant_id: str
+    created_at: str  # ISO with timezone
+    artifact_type: str
+    payload: dict[str, Any]
+    source: Optional[str] = None
+    meta: Optional[dict[str, Any]] = None
+
+
+class RunArtifactsListOut(BaseModel):
+    items: list[RunArtifactOut]
+    count: int
+    limit: int
+
+
+class RawIngestCreateIn(BaseModel):
+    facility_id: str
+    provider: str
+    mapping_version: Optional[str] = None
+    as_of: Optional[str] = None
+    payload: Any  # validated in route to be a JSON object
+
+
+class RawIngestOut(BaseModel):
+    id: str
+    run_id: str
+    tenant_id: str
+    facility_id: str
+    provider: str
+    mapping_version: Optional[str] = None
+    fetched_at: str
+    as_of: Optional[str] = None
+    payload: dict[str, Any]
+
+
+class InventoryItemUpsert(BaseModel):
+    sku: str
+    on_hand: int
+    available: Optional[int] = None
+    reserved: Optional[int] = None
+    source_ref: Optional[str] = None
+
+
+class InventoryItemsUpsertIn(BaseModel):
+    facility_id: str
+    source_provider: str
+    source_run_id: str
+    as_of: Optional[str] = None
+    items: list[InventoryItemUpsert]

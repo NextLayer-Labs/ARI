@@ -114,3 +114,53 @@ class PipelineRunLog(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str | None] = mapped_column(Text, nullable=True)
     meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class PipelineRunArtifact(Base):
+    __tablename__ = "pipeline_run_artifacts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("pipeline_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    artifact_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    source: Mapped[str | None] = mapped_column(Text, nullable=True)
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class PipelineRunRawIngest(Base):
+    __tablename__ = "pipeline_run_raw_ingests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("pipeline_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    facility_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    mapping_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class CanonicalInventoryItem(Base):
+    __tablename__ = "canonical_inventory_items"
+    tenant_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    facility_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    sku: Mapped[str] = mapped_column(Text, primary_key=True)
+    on_hand: Mapped[int] = mapped_column(nullable=False)
+    available: Mapped[int | None] = mapped_column(nullable=True)
+    reserved: Mapped[int | None] = mapped_column(nullable=True)
+    as_of: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    source_provider: Mapped[str] = mapped_column(Text, nullable=False)
+    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_ref: Mapped[str | None] = mapped_column(Text, nullable=True)

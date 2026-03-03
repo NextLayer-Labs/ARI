@@ -1,7 +1,9 @@
-import time
-import httpx
+import json
 import os
 import socket
+import time
+
+import httpx
 
 CP_BASE = os.getenv("CP_BASE", "http://localhost:8000").rstrip("/")
 WORKER_ID = os.getenv("WORKER_ID", f"{socket.gethostname()}:{os.getpid()}")
@@ -98,6 +100,134 @@ def complete_run(client: httpx.Client, run_id: str, status: str, error_message: 
     return None
 
 
+def _load_mock_inventory_fixture(name: str) -> dict:
+    base_dir = os.path.dirname(__file__)
+    fixtures_dir = os.path.join(base_dir, "fixtures")
+    path = os.path.join(fixtures_dir, name)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _execute_inventory_snapshot_v0(
+    client: httpx.Client,
+    run_id: str,
+    dag_spec: dict,
+    parameters: dict,
+) -> None:
+    facility_id = parameters.get("facility_id")
+    if not facility_id or not isinstance(facility_id, str):
+        raise ValueError("inventory_snapshot_v0 requires parameters.facility_id")
+
+    provider_cfg = dag_spec.get("provider") or {}
+    provider_type = provider_cfg.get("type") or "mock"
+    if provider_type != "mock":
+        raise ValueError(f"inventory_snapshot_v0 only supports provider.type='mock', got {provider_type!r}")
+    fixture_name = provider_cfg.get("fixture") or "inventory_mock_v1.json"
+    mapping_version = dag_spec.get("mapping_version") or "mock_v1"
+
+    append_log(
+        client,
+        run_id,
+        "Starting inventory_snapshot_v0",
+        source="worker",
+        meta={"facility_id": facility_id, "provider": provider_type, "fixture": fixture_name},
+    )
+
+    # Step 1: FETCH (mock)
+    append_log(client, run_id, "inventory_snapshot_v0: loading mock fixture", source="worker")
+    fixture = _load_mock_inventory_fixture(fixture_name)
+    as_of = fixture.get("as_of")
+
+    # Step 2: STORE RAW
+    append_log(client, run_id, "inventory_snapshot_v0: storing raw ingest", source="worker")
+    raw_body = {
+        "facility_id": facility_id,
+        "provider": provider_type,
+        "mapping_version": mapping_version,
+        "as_of": as_of,
+        "payload": fixture,
+    }
+    r_raw = client.post(f"{CP_BASE}/api/runs/{run_id}/raw-ingests", json=raw_body, timeout=10)
+    r_raw.raise_for_status()
+
+    # Step 3: MAP CANONICAL
+    items = fixture.get("items") or []
+    canonical_items = []
+    for item in items:
+        sku = item.get("sku")
+        if not sku or not isinstance(sku, str):
+            continue
+        on_hand = int(item.get("on_hand") or 0)
+        available = item.get("available")
+        reserved = item.get("reserved")
+        canonical_items.append(
+            {
+                "sku": sku,
+                "on_hand": on_hand,
+                "available": int(available) if available is not None else None,
+                "reserved": int(reserved) if reserved is not None else None,
+                "source_ref": None,
+            }
+        )
+
+    append_log(
+        client,
+        run_id,
+        "inventory_snapshot_v0: upserting canonical items",
+        source="worker",
+        meta={"items_count": len(canonical_items)},
+    )
+    upsert_body = {
+        "facility_id": facility_id,
+        "source_provider": provider_type,
+        "source_run_id": run_id,
+        "as_of": as_of,
+        "items": canonical_items,
+    }
+    r_upsert = client.post(f"{CP_BASE}/api/inventory/items:upsert", json=upsert_body, timeout=20)
+    r_upsert.raise_for_status()
+    upsert_data = r_upsert.json()
+
+    # Step 4: EMIT SUMMARY ARTIFACT
+    items_total = len(canonical_items)
+    out_of_stock_skus: list[str] = []
+    out_of_stock = 0
+    for c in canonical_items:
+        available_val = c["available"]
+        on_hand_val = c["on_hand"]
+        is_oos = (available_val is not None and available_val <= 0) or (
+            available_val is None and on_hand_val <= 0
+        )
+        if is_oos:
+            out_of_stock += 1
+            if len(out_of_stock_skus) < 10:
+                out_of_stock_skus.append(c["sku"])
+
+    summary_artifact_type = dag_spec.get("summary_artifact_type") or "inventory_summary"
+    summary_payload = {
+        "facility_id": facility_id,
+        "provider": provider_type,
+        "as_of": as_of,
+        "items_total": items_total,
+        "out_of_stock": out_of_stock,
+        "out_of_stock_skus_sample": out_of_stock_skus,
+        "upserted": upsert_data.get("upserted"),
+    }
+    append_log(
+        client,
+        run_id,
+        "inventory_snapshot_v0: writing summary artifact",
+        source="worker",
+        meta={"artifact_type": summary_artifact_type},
+    )
+    r_art = client.post(
+        f"{CP_BASE}/api/runs/{run_id}/artifacts",
+        json={"artifact_type": summary_artifact_type, "payload": summary_payload, "source": "data-plane-worker"},
+        timeout=10,
+    )
+    r_art.raise_for_status()
+
+
 def main():
     with httpx.Client(timeout=10) as client:
         while True:
@@ -119,25 +249,36 @@ def main():
                     raise ValueError("pipeline_version.dag_spec is required")
 
                 append_log(client, run_id, "Run began executing", source="worker", meta={"step": "execute"})
-                append_log(client, run_id, "Simulate work started", source="worker", meta={"step": "simulate"})
 
-                # Simulate work with periodic heartbeats
-                end_time = time.monotonic() + SIMULATE_SECONDS
-                last_heartbeat = time.monotonic()
-                stopped_early = False
-                while time.monotonic() < end_time:
-                    time.sleep(0.5)
-                    if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
-                        if not send_heartbeat(client, run_id):
-                            print(f"[worker] Run {run_id} no longer RUNNING; skipping completion")
-                            stopped_early = True
-                            break
-                        last_heartbeat = time.monotonic()
+                if isinstance(dag_spec, dict) and dag_spec.get("kind") == "inventory_snapshot_v0":
+                    append_log(
+                        client,
+                        run_id,
+                        "Executing inventory_snapshot_v0 pipeline",
+                        source="worker",
+                        meta={"kind": "inventory_snapshot_v0"},
+                    )
+                    _execute_inventory_snapshot_v0(client, run_id, dag_spec, run.get("parameters") or {})
+                else:
+                    append_log(client, run_id, "Simulate work started", source="worker", meta={"step": "simulate"})
+                    # Simulate work with periodic heartbeats
+                    end_time = time.monotonic() + SIMULATE_SECONDS
+                    last_heartbeat = time.monotonic()
+                    stopped_early = False
+                    while time.monotonic() < end_time:
+                        time.sleep(0.5)
+                        if time.monotonic() - last_heartbeat >= HEARTBEAT_SECONDS:
+                            if not send_heartbeat(client, run_id):
+                                print(f"[worker] Run {run_id} no longer RUNNING; skipping completion")
+                                stopped_early = True
+                                break
+                            last_heartbeat = time.monotonic()
 
-                if stopped_early:
-                    continue
+                    if stopped_early:
+                        continue
 
-                append_log(client, run_id, "Simulate work finished", source="worker", meta={"step": "simulate"})
+                    append_log(client, run_id, "Simulate work finished", source="worker", meta={"step": "simulate"})
+
                 out = complete_run(client, run_id, "SUCCEEDED")
                 if out is None:
                     print(f"Run {run_id} was cancelled or already terminal; skipping completion")
