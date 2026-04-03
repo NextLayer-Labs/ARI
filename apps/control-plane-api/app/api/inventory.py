@@ -14,6 +14,7 @@ router = APIRouter(prefix="/api/inventory", tags=["inventory"])
 
 
 def _get_run_tenant(db: Session, run_id: str) -> dict | None:
+    """Return a minimal run row (id, tenant_id) for the given run_id, or None if not found."""
     row = db.execute(
         text("SELECT id, tenant_id FROM pipeline_runs WHERE id = :run_id"),
         {"run_id": run_id},
@@ -23,6 +24,7 @@ def _get_run_tenant(db: Session, run_id: str) -> dict | None:
 
 @router.post("/items:upsert")
 def upsert_inventory_items(body: InventoryItemsUpsertIn, db: Session = Depends(get_db)):
+    """Bulk upsert canonical inventory items for a facility, deriving tenant_id from source_run_id."""
     if not body.items or len(body.items) == 0:
         raise HTTPException(status_code=400, detail="items_required")
     if len(body.items) > 5000:
@@ -86,8 +88,8 @@ def upsert_inventory_items(body: InventoryItemsUpsertIn, db: Session = Depends(g
             source_ref = EXCLUDED.source_ref
         """
     )
-    with db.begin():
-        db.execute(sql, params)
+    db.execute(sql, params)
+    db.commit()
     return {"ok": True, "upserted": len(body.items)}
 
 

@@ -101,6 +101,7 @@ def complete_run(client: httpx.Client, run_id: str, status: str, error_message: 
 
 
 def _load_mock_inventory_fixture(name: str) -> dict:
+    """Load a mock inventory JSON fixture from the local fixtures directory."""
     base_dir = os.path.dirname(__file__)
     fixtures_dir = os.path.join(base_dir, "fixtures")
     path = os.path.join(fixtures_dir, name)
@@ -114,6 +115,8 @@ def _execute_inventory_snapshot_v0(
     dag_spec: dict,
     parameters: dict,
 ) -> None:
+    """Execute the inventory_snapshot_v0 pipeline using a mock fixture and CP APIs."""
+    print(f"[worker] inventory_snapshot_v0 parameters type={type(parameters).__name__} value={parameters!r}")
     facility_id = parameters.get("facility_id")
     if not facility_id or not isinstance(facility_id, str):
         raise ValueError("inventory_snapshot_v0 requires parameters.facility_id")
@@ -244,6 +247,7 @@ def main():
             print(f"Claimed run {run_id} -> RUNNING")
 
             try:
+                print(f"[worker] claim keys: {list(claim.keys())}")
                 dag_spec = pipeline_version.get("dag_spec")
                 if dag_spec is None:
                     raise ValueError("pipeline_version.dag_spec is required")
@@ -258,7 +262,15 @@ def main():
                         source="worker",
                         meta={"kind": "inventory_snapshot_v0"},
                     )
-                    _execute_inventory_snapshot_v0(client, run_id, dag_spec, run.get("parameters") or {})
+                    params = run.get("parameters") or {}
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except json.JSONDecodeError:
+                            params = {}
+                    if not isinstance(params, dict):
+                        params = {}
+                    _execute_inventory_snapshot_v0(client, run_id, dag_spec, params)
                 else:
                     append_log(client, run_id, "Simulate work started", source="worker", meta={"step": "simulate"})
                     # Simulate work with periodic heartbeats

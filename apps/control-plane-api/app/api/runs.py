@@ -43,6 +43,8 @@ def _run_returning_sql(columns: set[str]) -> str:
         id,
         tenant_id,
         pipeline_version_id,
+        trigger_type,
+        parameters,
         status,
         started_at,
         {claimed_at},
@@ -565,6 +567,7 @@ def get_run_logs(
 
 @router.post("/{run_id}/raw-ingests")
 def create_run_raw_ingest(run_id: str, body: RawIngestCreateIn, db: Session = Depends(get_db)):
+    """Create a raw ingest row for a run, storing the provider payload as jsonb."""
     run = _run_exists(db, run_id)
     if run is None:
         return JSONResponse(

@@ -1,7 +1,7 @@
 # NextLayer MVP Documentation
 
 **Version:** 0.1.0  
-**Last Updated:** February 2026
+**Last Updated:** March 2026
 
 This document provides comprehensive documentation for the NextLayer MVP codebase, covering architecture, setup, API usage, and development workflows. The audience includes the founding team and future engineers joining the project.
 
@@ -268,6 +268,29 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `source` (text, nullable; e.g., "data-plane-worker", "control-plane")
 - `meta` (JSON, nullable; small metadata blob)
 
+#### PipelineRunRawIngest
+- `id` (UUID string, primary key)
+- `run_id` (UUID string, foreign key to pipeline_runs, `ON DELETE CASCADE`)
+- `tenant_id` (UUID string, denormalized; matches pipeline_runs.tenant_id)
+- `facility_id` (UUID string; matches facilities.id when present)
+- `provider` (text, e.g., "mock")
+- `mapping_version` (text, nullable; e.g., "mock_v1")
+- `fetched_at` (timestamptz, default now())
+- `as_of` (timestamptz, nullable; timestamp from provider payload if present)
+- `payload` (jsonb; raw provider payload)
+
+#### CanonicalInventoryItem
+- `tenant_id` (UUID string, NOT NULL; partition key)
+- `facility_id` (UUID string, NOT NULL)
+- `sku` (text, NOT NULL)
+- `on_hand` (int, NOT NULL)
+- `available` (int, nullable)
+- `reserved` (int, nullable)
+- `as_of` (timestamptz, nullable)
+- `last_seen_at` (timestamptz, NOT NULL, default now())
+- `source_provider` (text, NOT NULL, e.g., "mock")
+- `source_run_id` (UUID string, nullable; last run that updated this item)
+
 ### Key Endpoints
 
 #### Registry Endpoints (`/api/*`)
@@ -293,8 +316,9 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/runs/reap-stale` - Mark stale RUNNING runs as FAILED (body: `{ "stale_after_seconds": 300, "limit": 100 }` optional)
 - `GET /api/runs/{id}` - Get run details (includes retry_of_run_id, root_run_id, heartbeat_at when set)
 - `GET /api/runs` - List runs with filters and pagination (query params: tenant_id, status, retry_of_run_id; status includes CANCELLED)
- - `POST /api/runs/{id}/artifacts` - Create a JSON artifact for a run (e.g., inventory summary)
- - `GET /api/runs/{id}/artifacts` - List artifacts for a run (optional filters: artifact_type, limit, order)
+- `POST /api/runs/{id}/artifacts` - Create a JSON artifact for a run (e.g., inventory summary)
+- `GET /api/runs/{id}/artifacts` - List artifacts for a run (optional filters: artifact_type, limit, order)
+- `POST /api/runs/{id}/raw-ingests` - Append a raw ingest row (jsonb payload) for a run
 
 **Retry lineage:** Runs created via Retry store `retry_of_run_id` (parent run) and `root_run_id` (root of the retry chain). The dashboard run detail page shows “Retry of” (link to parent) and “Retries” (child runs). Use `GET /api/runs?retry_of_run_id=<run_id>` to list child retries.
 
@@ -413,16 +437,22 @@ The worker implements the following loop:
 1. **Claim Run**: `POST /api/runs/claim`
    - Returns `{"claimed": false}` if no QUEUED runs available
    - Returns `{"claimed": true, "run": {...}, "pipeline_version": {...}}` if a run was claimed
+   - `run` now includes `trigger_type` and `parameters`, so pipeline-specific executors can read runtime inputs (for example `parameters.facility_id` for `inventory_snapshot_v0`)
 
-2. **Execute Run** (simulated):
-   - Reads `dag_spec` from pipeline version
-   - Runs for `SIMULATE_SECONDS` (default 0.5s), sending `POST /api/runs/{id}/heartbeat` every `HEARTBEAT_SECONDS` (default 10s)
-   - If heartbeat returns 409 (run cancelled/reaped or worker_mismatch), stops without calling complete
-   - Handles exceptions
+2. **Execute Run**:
+   - Reads `dag_spec` from pipeline version.
+   - If `dag_spec.kind === "inventory_snapshot_v0"`:
+     - Loads mock inventory fixture from `apps/data-plane-worker/fixtures/inventory_mock_v1.json`.
+     - Calls `POST /api/runs/{run_id}/raw-ingests` to persist the raw payload (jsonb).
+     - Maps raw items to canonical items and calls `POST /api/inventory/items:upsert` to upsert canonical inventory.
+     - Computes an `inventory_summary` payload and calls `POST /api/runs/{run_id}/artifacts` with `artifact_type="inventory_summary"`.
+   - Otherwise (fallback path):
+     - Runs for `SIMULATE_SECONDS` (default 0.5s), sending `POST /api/runs/{id}/heartbeat` every `HEARTBEAT_SECONDS` (default 10s).
+   - In both paths, if heartbeat returns 409 (run cancelled/reaped or worker_mismatch), the worker stops processing the run without calling complete.
+   - Handles exceptions and logs errors via `POST /api/runs/{id}/logs`.
 
 3. **Complete Run**: `POST /api/runs/{id}/complete`
-   - Status: `SUCCEEDED` or `FAILED`
-   - Error message included if failed
+   - Status: `SUCCEEDED` when all inventory or simulation steps succeed, or `FAILED` with error_message on error
 
 4. **Sleep**: Waits `POLL_SECONDS` before next iteration
 
@@ -517,6 +547,13 @@ The dashboard will be available at `http://localhost:3000`
 - **Actions**: Cancel (QUEUED/RUNNING), **Retry** (FAILED/CANCELLED) — Retry opens a modal with the current run’s parameters (editable JSON); you can change them before creating the new run; on success you are redirected to the new run page
 - Link back to runs list
 - Fetches data on mount; polls status/logs until terminal; fetches child retries for lineage
+- When an `inventory_summary` artifact exists for the run, shows an **Inventory Summary** card with:
+  - facility_id
+  - provider
+  - as_of (local time with ISO timestamp on hover)
+  - items_total
+  - out_of_stock
+  - a sample list of out_of_stock SKUs
 
 #### `/pipeline-versions` - Pipeline Versions List
 
@@ -1134,6 +1171,10 @@ Atomically claim a QUEUED run (SKIP LOCKED).
     "id": "uuid",
     "tenant_id": "uuid",
     "pipeline_version_id": "uuid",
+    "trigger_type": "manual",
+    "parameters": {
+      "facility_id": "facility-uuid"
+    },
     "status": "RUNNING",
     "started_at": "2026-02-11T12:00:00+00:00",
     "claimed_at": "2026-02-11T12:00:00+00:00",
@@ -1329,6 +1370,121 @@ List artifacts for a run.
 }
 ```
 
+#### POST /api/runs/{id}/raw-ingests
+
+Create a raw ingest row associated with a pipeline run. The ingest inherits its tenant from the run.
+
+**Request Body:**
+```json
+{
+  "facility_id": "facility-uuid",
+  "provider": "mock",
+  "mapping_version": "mock_v1",
+  "as_of": "2026-03-01T00:00:00Z",
+  "payload": {
+    "as_of": "2026-03-01T00:00:00Z",
+    "items": [
+      { "sku": "SKU1", "on_hand": 10, "available": 8, "reserved": 2 },
+      { "sku": "SKU2", "on_hand": 0, "available": 0, "reserved": 0 }
+    ]
+  }
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "ok": true,
+  "raw_ingest": {
+    "id": "uuid",
+    "run_id": "uuid",
+    "tenant_id": "uuid",
+    "facility_id": "facility-uuid",
+    "provider": "mock",
+    "mapping_version": "mock_v1",
+    "fetched_at": "2026-03-01T00:05:00+00:00",
+    "as_of": "2026-03-01T00:00:00+00:00",
+    "payload": {
+      "as_of": "2026-03-01T00:00:00Z",
+      "items": [
+        { "sku": "SKU1", "on_hand": 10, "available": 8, "reserved": 2 },
+        { "sku": "SKU2", "on_hand": 0, "available": 0, "reserved": 0 }
+      ]
+    }
+  }
+}
+```
+
+**Errors:**
+- `404 Not Found`: Run not found
+- `400 Bad Request`: `payload` is not a JSON object
+
+### Inventory Endpoints
+
+#### POST /api/inventory/items:upsert
+
+Bulk upsert canonical inventory items for a facility; tenant_id is derived from `source_run_id`.
+
+**Request Body:**
+```json
+{
+  "source_run_id": "run-uuid",
+  "facility_id": "facility-uuid",
+  "source_provider": "mock",
+  "as_of": "2026-03-01T00:00:00Z",
+  "items": [
+    { "sku": "SKU1", "on_hand": 10, "available": 8, "reserved": 2 },
+    { "sku": "SKU2", "on_hand": 0, "available": 0, "reserved": 0 }
+  ]
+}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "ok": true,
+  "upserted": 2
+}
+```
+
+**Errors:**
+- `404 Not Found`: `source_run_id` not found
+- `400 Bad Request`: invalid sku/on_hand/items list too large or empty
+
+#### GET /api/inventory/items
+
+List canonical inventory items for a facility (optionally filtered by tenant).
+
+**Query Parameters:**
+- `facility_id` (required)
+- `tenant_id` (optional)
+- `limit` (default 50, max 200)
+- `offset` (default 0)
+
+**Response:** `200 OK`
+```json
+{
+  "items": [
+    {
+      "tenant_id": "uuid",
+      "facility_id": "facility-uuid",
+      "sku": "SKU1",
+      "on_hand": 10,
+      "available": 8,
+      "reserved": 2,
+      "as_of": "2026-03-01T00:00:00+00:00",
+      "last_seen_at": "2026-03-01T00:05:00+00:00",
+      "source_provider": "mock",
+      "source_run_id": "run-uuid",
+      "source_ref": null
+    }
+  ],
+  "limit": 50,
+  "offset": 0,
+  "count": 1
+}
+```
+
 ---
 
 ## Status & Next Steps
@@ -1473,6 +1629,27 @@ List artifacts for a run.
 3. Verify API is accessible: `curl http://localhost:8000/health`
 4. Check worker logs for errors
 
+#### inventory_snapshot_v0 missing facility_id
+
+**Problem:** Run fails with `inventory_snapshot_v0 requires parameters.facility_id` even though the run was created with `parameters.facility_id`.
+
+**Cause:** Worker reads parameters from `claim.run.parameters`; if `POST /api/runs/claim` omits `parameters` in the returned `run` object, worker validation fails.
+
+**Current behavior:** `POST /api/runs/claim` includes `run.parameters` and `run.trigger_type`.
+
+**Checks:**
+1. Verify run creation payload includes `parameters.facility_id`.
+2. Verify worker log shows parameters before validation (type/value debug line).
+3. Verify claim response contains `run.parameters` when inspecting API output.
+
+#### 500 on POST /api/inventory/items:upsert
+
+**Problem:** Worker fails run with `500 Internal Server Error` when calling `/api/inventory/items:upsert`.
+
+**Cause:** Endpoint attempted `with db.begin()` after prior session usage, causing `sqlalchemy.exc.InvalidRequestError: A transaction is already begun on this Session.`
+
+**Current behavior:** Endpoint executes and commits directly on the existing session transaction (`db.execute(...)` + `db.commit()`), avoiding nested transaction start.
+
 #### Timezone Display Issues
 
 **Problem:** Timestamps show incorrect times in dashboard
@@ -1521,10 +1698,5 @@ List artifacts for a run.
 ---
 
 **Document Version:** 1.0  
-**Last Updated:** February 2026  
+**Last Updated:** March 2026  
 **Maintained by:** NextLayer Team
-#   A R I 
- 
- #   A R I 
- 
- 
