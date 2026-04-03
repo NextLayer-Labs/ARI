@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import time
+from pathlib import Path
 
 import httpx
 
@@ -14,6 +15,12 @@ SIMULATE_SECONDS = float(os.getenv("SIMULATE_SECONDS", "0.5"))
 
 # Backoff delays in seconds for complete_run retries (max 5 attempts)
 COMPLETE_RETRY_DELAYS = [0.5, 1.0, 2.0, 4.0, 8.0]
+
+LOG_SOURCE = "data-plane-worker"
+DEFAULT_FIXTURE = "inventory_mock_v1.json"
+INVENTORY_PAGE_LIMIT = 500
+TOP_DELTA_LIMIT = 15
+SKU_SAMPLE_LIMIT = 8
 
 
 def append_log(
@@ -100,13 +107,212 @@ def complete_run(client: httpx.Client, run_id: str, status: str, error_message: 
     return None
 
 
-def _load_mock_inventory_fixture(name: str) -> dict:
-    """Load a mock inventory JSON fixture from the local fixtures directory."""
-    base_dir = os.path.dirname(__file__)
-    fixtures_dir = os.path.join(base_dir, "fixtures")
-    path = os.path.join(fixtures_dir, name)
-    with open(path, "r", encoding="utf-8") as f:
+def _fixtures_dir() -> Path:
+    return Path(__file__).resolve().parent / "fixtures"
+
+
+def _resolve_safe_fixture_path(fixtures_dir: Path, filename: str) -> Path:
+    """Resolve a fixture filename to a path under fixtures_dir; reject traversal and invalid names."""
+    if not isinstance(filename, str):
+        raise ValueError("fixture name must be a string")
+    name = filename.strip()
+    if not name:
+        raise ValueError("fixture name cannot be empty")
+    p = Path(name)
+    if p.name != name or p.parts != (name,):
+        raise ValueError(
+            "fixture name must be a single file name (no path separators or parent segments); "
+            f"got {filename!r}"
+        )
+    fixtures_dir = fixtures_dir.resolve()
+    candidate = (fixtures_dir / name).resolve()
+    try:
+        candidate.relative_to(fixtures_dir)
+    except ValueError:
+        raise ValueError("fixture path escapes fixtures directory") from None
+    if not candidate.is_file():
+        raise ValueError(f"fixture file not found: {name}")
+    return candidate
+
+
+def _validate_inventory_dag_spec(dag_spec: dict) -> None:
+    """Fail fast on invalid provider config for inventory_snapshot_v0."""
+    prov = dag_spec.get("provider")
+    if prov is not None and not isinstance(prov, dict):
+        raise ValueError("inventory_snapshot_v0 requires dag_spec.provider to be an object when set")
+    provider_cfg = prov or {}
+    provider_type = provider_cfg.get("type") or "mock"
+    if provider_type != "mock":
+        raise ValueError(
+            f"inventory_snapshot_v0 only supports provider.type='mock'; got {provider_type!r}"
+        )
+    fx = provider_cfg.get("fixture")
+    if fx is not None and not isinstance(fx, str):
+        raise ValueError("dag_spec.provider.fixture must be a string when set")
+
+
+def _fixture_name_for_run(dag_spec: dict, parameters: dict) -> str:
+    """Return fixture filename: parameters.fixture overrides dag_spec.provider.fixture then default."""
+    if "fixture" in parameters:
+        ov = parameters["fixture"]
+        if ov is None:
+            raise ValueError("parameters.fixture cannot be null; omit the key to use the pipeline default")
+        if not isinstance(ov, str):
+            raise ValueError(
+                "parameters.fixture must be a string (e.g. inventory_mock_v2.json); "
+                f"got {type(ov).__name__}"
+            )
+        return ov.strip() or (_invalid_empty_fixture())
+    provider_cfg = dag_spec.get("provider") or {}
+    return provider_cfg.get("fixture") or DEFAULT_FIXTURE
+
+
+def _invalid_empty_fixture() -> str:
+    raise ValueError("parameters.fixture cannot be empty; omit the key to use the pipeline default")
+
+
+def _load_inventory_fixture(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _fetch_canonical_inventory_for_facility(
+    client: httpx.Client,
+    facility_id: str,
+    tenant_id: str,
+) -> list[dict]:
+    """Fetch all canonical rows for a facility with tenant scoping (paginated)."""
+    out: list[dict] = []
+    offset = 0
+    while True:
+        r = client.get(
+            f"{CP_BASE}/api/inventory/items",
+            params={
+                "facility_id": facility_id,
+                "tenant_id": tenant_id,
+                "limit": INVENTORY_PAGE_LIMIT,
+                "offset": offset,
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        batch = data.get("items") or []
+        out.extend(batch)
+        total = int(data.get("count") or 0)
+        offset += len(batch)
+        if offset >= total or len(batch) == 0:
+            break
+    return out
+
+
+def _row_to_qty(row: dict) -> tuple[int, int | None, int | None]:
+    oh = int(row.get("on_hand") or 0)
+    av = row.get("available")
+    rs = row.get("reserved")
+    return (
+        oh,
+        int(av) if av is not None else None,
+        int(rs) if rs is not None else None,
+    )
+
+
+def _triples_equal(
+    a: tuple[int, int | None, int | None],
+    b: tuple[int, int | None, int | None],
+) -> bool:
+    return a == b
+
+
+def _compute_inventory_delta(
+    previous_by_sku: dict[str, tuple[int, int | None, int | None]],
+    new_by_sku: dict[str, tuple[int, int | None, int | None]],
+) -> dict:
+    """Compare previous canonical state to the new snapshot; returns delta payload fields."""
+    prev_skus = set(previous_by_sku.keys())
+    new_skus = set(new_by_sku.keys())
+    new_only = new_skus - prev_skus
+    removed = prev_skus - new_skus
+    both = prev_skus & new_skus
+
+    unchanged = 0
+    changed_any = 0
+    qty_on_hand_changed = 0
+    new_out_of_stock: list[str] = []
+    back_in_stock: list[str] = []
+    top_deltas: list[dict] = []
+
+    total_on_hand_previous = sum(previous_by_sku[s][0] for s in prev_skus)
+    total_on_hand_current = sum(new_by_sku[s][0] for s in new_skus)
+
+    for sku in both:
+        p = previous_by_sku[sku]
+        c = new_by_sku[sku]
+        if _triples_equal(p, c):
+            unchanged += 1
+        else:
+            changed_any += 1
+        if p[0] != c[0]:
+            qty_on_hand_changed += 1
+        prev_oh, cur_oh = p[0], c[0]
+        if prev_oh > 0 and cur_oh == 0:
+            if len(new_out_of_stock) < SKU_SAMPLE_LIMIT:
+                new_out_of_stock.append(sku)
+        if prev_oh == 0 and cur_oh > 0:
+            if len(back_in_stock) < SKU_SAMPLE_LIMIT:
+                back_in_stock.append(sku)
+        d = cur_oh - prev_oh
+        if d != 0:
+            top_deltas.append(
+                {
+                    "sku": sku,
+                    "previous_on_hand": prev_oh,
+                    "current_on_hand": cur_oh,
+                    "delta_on_hand": d,
+                }
+            )
+
+    for sku in sorted(new_only):
+        c = new_by_sku[sku]
+        cur_oh = c[0]
+        top_deltas.append(
+            {
+                "sku": sku,
+                "previous_on_hand": 0,
+                "current_on_hand": cur_oh,
+                "delta_on_hand": cur_oh,
+            }
+        )
+
+    for sku in sorted(removed):
+        p = previous_by_sku[sku]
+        prev_oh = p[0]
+        top_deltas.append(
+            {
+                "sku": sku,
+                "previous_on_hand": prev_oh,
+                "current_on_hand": 0,
+                "delta_on_hand": -prev_oh,
+            }
+        )
+
+    top_deltas.sort(key=lambda x: abs(x["delta_on_hand"]), reverse=True)
+    top_deltas = top_deltas[:TOP_DELTA_LIMIT]
+
+    return {
+        "changed_skus_count": changed_any,
+        "unchanged_skus_count": unchanged,
+        "new_skus_count": len(new_only),
+        "removed_skus_count": len(removed),
+        "removed_skus_sample": sorted(removed)[:SKU_SAMPLE_LIMIT],
+        "new_out_of_stock_skus": new_out_of_stock,
+        "back_in_stock_skus": back_in_stock,
+        "quantity_changed_skus_count": qty_on_hand_changed,
+        "top_deltas": top_deltas,
+        "total_on_hand_previous": total_on_hand_previous,
+        "total_on_hand_current": total_on_hand_current,
+        "total_on_hand_delta": total_on_hand_current - total_on_hand_previous,
+    }
 
 
 def _execute_inventory_snapshot_v0(
@@ -114,35 +320,106 @@ def _execute_inventory_snapshot_v0(
     run_id: str,
     dag_spec: dict,
     parameters: dict,
+    tenant_id: str,
 ) -> None:
     """Execute the inventory_snapshot_v0 pipeline using a mock fixture and CP APIs."""
     print(f"[worker] inventory_snapshot_v0 parameters type={type(parameters).__name__} value={parameters!r}")
+    _validate_inventory_dag_spec(dag_spec)
+
     facility_id = parameters.get("facility_id")
     if not facility_id or not isinstance(facility_id, str):
-        raise ValueError("inventory_snapshot_v0 requires parameters.facility_id")
+        raise ValueError(
+            "inventory_snapshot_v0 requires parameters.facility_id (non-empty string UUID for the facility)"
+        )
 
     provider_cfg = dag_spec.get("provider") or {}
     provider_type = provider_cfg.get("type") or "mock"
-    if provider_type != "mock":
-        raise ValueError(f"inventory_snapshot_v0 only supports provider.type='mock', got {provider_type!r}")
-    fixture_name = provider_cfg.get("fixture") or "inventory_mock_v1.json"
     mapping_version = dag_spec.get("mapping_version") or "mock_v1"
+
+    fixture_name = _fixture_name_for_run(dag_spec, parameters)
+    fixtures_dir = _fixtures_dir()
+    append_log(
+        client,
+        run_id,
+        "Validating fixture selection for inventory snapshot",
+        source=LOG_SOURCE,
+        meta={"pipeline_default": provider_cfg.get("fixture") or DEFAULT_FIXTURE, "resolved": fixture_name},
+    )
+    try:
+        fixture_path = _resolve_safe_fixture_path(fixtures_dir, fixture_name)
+    except ValueError as e:
+        append_log(
+            client,
+            f"Fixture validation failed: {e}",
+            level="ERROR",
+            source=LOG_SOURCE,
+            meta={"stage": "validate_fixture"},
+        )
+        raise
 
     append_log(
         client,
         run_id,
         "Starting inventory_snapshot_v0",
-        source="worker",
-        meta={"facility_id": facility_id, "provider": provider_type, "fixture": fixture_name},
+        source=LOG_SOURCE,
+        meta={
+            "facility_id": facility_id,
+            "tenant_id": tenant_id,
+            "provider": provider_type,
+            "fixture": fixture_name,
+            "fixture_path": fixture_path.name,
+        },
     )
 
-    # Step 1: FETCH (mock)
-    append_log(client, run_id, "inventory_snapshot_v0: loading mock fixture", source="worker")
-    fixture = _load_mock_inventory_fixture(fixture_name)
+    append_log(
+        client,
+        run_id,
+        "Loading inventory fixture from disk",
+        source=LOG_SOURCE,
+        meta={"fixture": fixture_name},
+    )
+    try:
+        fixture = _load_inventory_fixture(fixture_path)
+    except OSError as e:
+        append_log(
+            client,
+            run_id,
+            f"Failed to read fixture file: {e}",
+            level="ERROR",
+            source=LOG_SOURCE,
+            meta={"stage": "load_fixture"},
+        )
+        raise
     as_of = fixture.get("as_of")
 
-    # Step 2: STORE RAW
-    append_log(client, run_id, "inventory_snapshot_v0: storing raw ingest", source="worker")
+    append_log(
+        client,
+        run_id,
+        "Fetching previous canonical inventory for facility",
+        source=LOG_SOURCE,
+        meta={"facility_id": facility_id},
+    )
+    try:
+        prev_rows = _fetch_canonical_inventory_for_facility(client, facility_id, tenant_id)
+    except Exception as e:
+        append_log(
+            client,
+            run_id,
+            f"Failed to fetch canonical inventory: {e}",
+            level="ERROR",
+            source=LOG_SOURCE,
+            meta={"stage": "fetch_previous_canonical"},
+        )
+        raise
+    previous_by_sku = {r["sku"]: _row_to_qty(r) for r in prev_rows if r.get("sku")}
+
+    append_log(
+        client,
+        run_id,
+        "Writing raw ingest payload",
+        source=LOG_SOURCE,
+        meta={"facility_id": facility_id},
+    )
     raw_body = {
         "facility_id": facility_id,
         "provider": provider_type,
@@ -153,7 +430,7 @@ def _execute_inventory_snapshot_v0(
     r_raw = client.post(f"{CP_BASE}/api/runs/{run_id}/raw-ingests", json=raw_body, timeout=10)
     r_raw.raise_for_status()
 
-    # Step 3: MAP CANONICAL
+    # Step: MAP CANONICAL
     items = fixture.get("items") or []
     canonical_items = []
     for item in items:
@@ -176,8 +453,29 @@ def _execute_inventory_snapshot_v0(
     append_log(
         client,
         run_id,
-        "inventory_snapshot_v0: upserting canonical items",
-        source="worker",
+        "Mapping raw snapshot rows to canonical inventory items",
+        source=LOG_SOURCE,
+        meta={"mapped_items": len(canonical_items)},
+    )
+
+    new_by_sku = {
+        c["sku"]: (c["on_hand"], c["available"], c["reserved"]) for c in canonical_items
+    }
+
+    append_log(
+        client,
+        run_id,
+        "Computing inventory deltas vs previous canonical state",
+        source=LOG_SOURCE,
+        meta={"previous_skus": len(previous_by_sku), "new_skus": len(new_by_sku)},
+    )
+    delta_block = _compute_inventory_delta(previous_by_sku, new_by_sku)
+
+    append_log(
+        client,
+        run_id,
+        "Upserting canonical inventory items",
+        source=LOG_SOURCE,
         meta={"items_count": len(canonical_items)},
     )
     upsert_body = {
@@ -187,11 +485,22 @@ def _execute_inventory_snapshot_v0(
         "as_of": as_of,
         "items": canonical_items,
     }
-    r_upsert = client.post(f"{CP_BASE}/api/inventory/items:upsert", json=upsert_body, timeout=20)
-    r_upsert.raise_for_status()
+    try:
+        r_upsert = client.post(f"{CP_BASE}/api/inventory/items:upsert", json=upsert_body, timeout=20)
+        r_upsert.raise_for_status()
+    except Exception as e:
+        append_log(
+            client,
+            run_id,
+            f"Canonical upsert failed: {e}",
+            level="ERROR",
+            source=LOG_SOURCE,
+            meta={"stage": "upsert_canonical"},
+        )
+        raise
     upsert_data = r_upsert.json()
 
-    # Step 4: EMIT SUMMARY ARTIFACT
+    # Summary artifact
     items_total = len(canonical_items)
     out_of_stock_skus: list[str] = []
     out_of_stock = 0
@@ -208,27 +517,52 @@ def _execute_inventory_snapshot_v0(
 
     summary_artifact_type = dag_spec.get("summary_artifact_type") or "inventory_summary"
     summary_payload = {
+        "schema_version": 1,
         "facility_id": facility_id,
+        "tenant_id": tenant_id,
         "provider": provider_type,
+        "mapping_version": mapping_version,
         "as_of": as_of,
+        "fixture_used": fixture_name,
         "items_total": items_total,
         "out_of_stock": out_of_stock,
         "out_of_stock_skus_sample": out_of_stock_skus,
         "upserted": upsert_data.get("upserted"),
+        "delta": delta_block,
     }
+
     append_log(
         client,
         run_id,
-        "inventory_snapshot_v0: writing summary artifact",
-        source="worker",
+        "Writing inventory summary artifact",
+        source=LOG_SOURCE,
         meta={"artifact_type": summary_artifact_type},
     )
-    r_art = client.post(
-        f"{CP_BASE}/api/runs/{run_id}/artifacts",
-        json={"artifact_type": summary_artifact_type, "payload": summary_payload, "source": "data-plane-worker"},
-        timeout=10,
+    try:
+        r_art = client.post(
+            f"{CP_BASE}/api/runs/{run_id}/artifacts",
+            json={"artifact_type": summary_artifact_type, "payload": summary_payload, "source": LOG_SOURCE},
+            timeout=10,
+        )
+        r_art.raise_for_status()
+    except Exception as e:
+        append_log(
+            client,
+            run_id,
+            f"Artifact write failed: {e}",
+            level="ERROR",
+            source=LOG_SOURCE,
+            meta={"stage": "write_summary_artifact"},
+        )
+        raise
+
+    append_log(
+        client,
+        run_id,
+        "inventory_snapshot_v0 workflow completed",
+        source=LOG_SOURCE,
+        meta={"items_total": items_total, "fixture": fixture_name},
     )
-    r_art.raise_for_status()
 
 
 def main():
@@ -243,6 +577,19 @@ def main():
             run = claim["run"]
             pipeline_version = claim["pipeline_version"]
             run_id = run["id"]
+            tenant_id = run.get("tenant_id")
+            if not tenant_id:
+                append_log(
+                    client,
+                    run_id,
+                    "Run missing tenant_id; cannot execute",
+                    level="ERROR",
+                    source="worker",
+                    meta={"status": "FAILED"},
+                )
+                complete_run(client, run_id, "FAILED", error_message="run missing tenant_id")
+                continue
+
             append_log(client, run_id, f"Claimed run {run_id}", source="worker", meta={"run_id": run_id})
             print(f"Claimed run {run_id} -> RUNNING")
 
@@ -259,7 +606,7 @@ def main():
                         client,
                         run_id,
                         "Executing inventory_snapshot_v0 pipeline",
-                        source="worker",
+                        source=LOG_SOURCE,
                         meta={"kind": "inventory_snapshot_v0"},
                     )
                     params = run.get("parameters") or {}
@@ -270,7 +617,7 @@ def main():
                             params = {}
                     if not isinstance(params, dict):
                         params = {}
-                    _execute_inventory_snapshot_v0(client, run_id, dag_spec, params)
+                    _execute_inventory_snapshot_v0(client, run_id, dag_spec, params, tenant_id)
                 else:
                     append_log(client, run_id, "Simulate work started", source="worker", meta={"step": "simulate"})
                     # Simulate work with periodic heartbeats

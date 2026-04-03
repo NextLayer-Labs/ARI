@@ -442,10 +442,10 @@ The worker implements the following loop:
 2. **Execute Run**:
    - Reads `dag_spec` from pipeline version.
    - If `dag_spec.kind === "inventory_snapshot_v0"`:
-     - Loads mock inventory fixture from `apps/data-plane-worker/fixtures/inventory_mock_v1.json`.
-     - Calls `POST /api/runs/{run_id}/raw-ingests` to persist the raw payload (jsonb).
-     - Maps raw items to canonical items and calls `POST /api/inventory/items:upsert` to upsert canonical inventory.
-     - Computes an `inventory_summary` payload and calls `POST /api/runs/{run_id}/artifacts` with `artifact_type="inventory_summary"`.
+     - Resolves the fixture file under `apps/data-plane-worker/fixtures/`: default `dag_spec.provider.fixture` or `inventory_mock_v1.json`; a run may override with `parameters.fixture` (must be a single file name, no path segments; validated before any writes).
+     - Fetches prior canonical rows for the same facility via `GET /api/inventory/items` (tenant-scoped using the run’s `tenant_id`) before upserting.
+     - Writes raw ingest, maps items, compares the new snapshot to the prior canonical state to compute **delta** fields (changed/new/removed SKUs, OOS transitions, top on-hand deltas, optional totals), then upserts canonical inventory.
+     - Writes an `inventory_summary` artifact (`schema_version` 1) including a `delta` object and calls `POST /api/runs/{run_id}/artifacts` with `artifact_type="inventory_summary"`.
    - Otherwise (fallback path):
      - Runs for `SIMULATE_SECONDS` (default 0.5s), sending `POST /api/runs/{id}/heartbeat` every `HEARTBEAT_SECONDS` (default 10s).
    - In both paths, if heartbeat returns 409 (run cancelled/reaped or worker_mismatch), the worker stops processing the run without calling complete.
@@ -548,12 +548,11 @@ The dashboard will be available at `http://localhost:3000`
 - Link back to runs list
 - Fetches data on mount; polls status/logs until terminal; fetches child retries for lineage
 - When an `inventory_summary` artifact exists for the run, shows an **Inventory Summary** card with:
-  - facility_id
-  - provider
-  - as_of (local time with ISO timestamp on hover)
-  - items_total
-  - out_of_stock
-  - a sample list of out_of_stock SKUs
+  - facility_id, optional tenant_id, provider, fixture used (when present), as_of
+  - items_total, out_of_stock, sample OOS SKUs
+  - When the artifact includes `delta` (newer worker): change counts (changed / unchanged / new / removed), on-hand quantity changes, optional total on-hand prev→curr, samples for newly OOS and back-in-stock SKUs, and top on-hand deltas
+- **Logs** show optional `meta` JSON under each line when present (step metadata from the data-plane worker).
+- Section order on the page: … → Parameters → **Inventory Summary** → Logs (outputs sit next to the execution trace).
 
 #### `/pipeline-versions` - Pipeline Versions List
 
@@ -869,6 +868,91 @@ Write-Host "Approved pipeline version: $($approvedVersion.status)" -ForegroundCo
 ```
 
 **Quick seed for Pipeline Versions UI (dashboard):** To test the Pipeline Versions list and Approve/Deprecate UI at `http://localhost:3000/pipeline-versions`, run only the "Create a Tenant", "Create a Pipeline", and "Create a Pipeline Version (DRAFT)" blocks above (do not approve). Then open `/pipeline-versions` and use the Approve button; optionally Deprecate afterward.
+
+### Inventory snapshot delta (two fixtures)
+
+Use this to verify **canonical delta** across two runs for the same facility. The worker must be running (`python worker.py` from `apps/data-plane-worker`). Fixtures live in `apps/data-plane-worker/fixtures/`: `inventory_mock_v1.json` (baseline) and `inventory_mock_v2.json` (changed rows vs v1).
+
+**What to expect**
+
+- **Run 1** (`parameters.fixture` omitted): loads v1; `delta.new_skus_count` equals all SKUs (no prior canonical rows); `delta.removed_skus_count` is 0.
+- **Run 2** (same `facility_id`, `parameters.fixture = "inventory_mock_v2.json"`): compares v2 snapshot to canonical state left by run 1 — e.g. new SKU4, SKU3 newly OOS, SKU2 back in stock, SKU1 large on-hand drop; see `delta` on the artifact and the **Inventory Summary** card on `/runs/[id]`.
+- **Canonical inventory** after run 2 matches v2 (`GET /api/inventory/items?facility_id=...&tenant_id=...`).
+
+**`delta` fields (artifact `payload.delta`)**
+
+| Field | Meaning |
+| --- | --- |
+| `changed_skus_count` | SKUs present in both previous and new snapshot with any change to on_hand / available / reserved |
+| `unchanged_skus_count` | SKUs identical to prior canonical row |
+| `new_skus_count` | SKUs in snapshot not in prior canonical set |
+| `removed_skus_count` | SKUs that were canonical before but absent from this snapshot (feed dropped the SKU) |
+| `quantity_changed_skus_count` | SKUs where **on_hand** changed vs prior |
+| `new_out_of_stock_skus` | Sample: prior `on_hand > 0`, current `on_hand == 0` |
+| `back_in_stock_skus` | Sample: prior `on_hand == 0`, current `on_hand > 0` |
+| `top_deltas` | Rows with the largest absolute `delta_on_hand` (includes new and removed SKUs as appropriate) |
+| `total_on_hand_*` | Sums of on_hand over prior canonical rows vs new snapshot rows |
+
+```powershell
+# 1) Tenant + pipeline
+$tenantBody = @{ name = "Delta Demo Tenant" } | ConvertTo-Json
+$tenant = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/tenants" -ContentType "application/json" -Body $tenantBody
+$tenantId = $tenant.id
+
+$pipelineBody = @{ tenant_id = $tenantId; name = "Inventory Delta Pipeline"; description = "demo" } | ConvertTo-Json
+$pipeline = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/pipelines" -ContentType "application/json" -Body $pipelineBody
+$pipelineId = $pipeline.id
+
+# 2) Facility
+$facilityBody = @{ tenant_id = $tenantId; name = "Demo Facility" } | ConvertTo-Json
+$facility = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/facilities" -ContentType "application/json" -Body $facilityBody
+$facilityId = $facility.id
+
+# 3) Pipeline version: inventory_snapshot_v0, default fixture v1
+$versionBody = @{
+    tenant_id = $tenantId
+    pipeline_id = $pipelineId
+    version = "inv-1"
+    dag_spec = @{
+        kind = "inventory_snapshot_v0"
+        provider = @{ type = "mock"; fixture = "inventory_mock_v1.json" }
+    }
+} | ConvertTo-Json -Depth 10
+
+$version = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/pipeline-versions" -ContentType "application/json" -Body $versionBody
+$versionId = $version.id
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/pipeline-versions/$versionId/status" -ContentType "application/json" -Body (@{ status = "APPROVED" } | ConvertTo-Json)
+
+# 4) Run #1 — default fixture (v1)
+$run1Body = @{
+    tenant_id = $tenantId
+    pipeline_version_id = $versionId
+    trigger_type = "manual"
+    parameters = @{ facility_id = $facilityId }
+} | ConvertTo-Json -Depth 10
+
+$run1 = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/runs" -ContentType "application/json" -Body $run1Body
+$run1Id = $run1.id
+Write-Host "Run 1: $run1Id — wait until SUCCEEDED, then run #2" -ForegroundColor Cyan
+
+# 5) Run #2 — override fixture to v2 (poll run1 first)
+$run2Body = @{
+    tenant_id = $tenantId
+    pipeline_version_id = $versionId
+    trigger_type = "manual"
+    parameters = @{
+        facility_id = $facilityId
+        fixture = "inventory_mock_v2.json"
+    }
+} | ConvertTo-Json -Depth 10
+
+$run2 = Invoke-RestMethod -Method Post -Uri "http://localhost:8000/api/runs" -ContentType "application/json" -Body $run2Body
+$run2Id = $run2.id
+Write-Host "Run 2: $run2Id — open http://localhost:3000/runs/$run2Id for delta + logs" -ForegroundColor Green
+```
+
+**Dashboard:** On an **APPROVED** `inventory_snapshot_v0` version, use **Run** / **Trigger run** and pass parameters JSON, e.g. `{ "facility_id": "<uuid>" }` then `{ "facility_id": "<same>", "fixture": "inventory_mock_v2.json" }`. **Retry** on a finished run pre-fills parameters so you can edit the fixture for a new run.
 
 ### Step 2: Create a Run
 
@@ -1458,7 +1542,7 @@ List canonical inventory items for a facility (optionally filtered by tenant).
 **Query Parameters:**
 - `facility_id` (required)
 - `tenant_id` (optional)
-- `limit` (default 50, max 200)
+- `limit` (default 50, max 500)
 - `offset` (default 0)
 
 **Response:** `200 OK`
@@ -1641,6 +1725,12 @@ List canonical inventory items for a facility (optionally filtered by tenant).
 1. Verify run creation payload includes `parameters.facility_id`.
 2. Verify worker log shows parameters before validation (type/value debug line).
 3. Verify claim response contains `run.parameters` when inspecting API output.
+
+#### inventory_snapshot_v0 fixture validation failures
+
+**Problem:** Run fails with messages such as `fixture file not found`, `fixture path escapes fixtures directory`, `parameters.fixture must be a string`, or `fixture name must be a single file name`.
+
+**Solutions:** Pass only a file name that exists under `apps/data-plane-worker/fixtures/` (for example `inventory_mock_v2.json`). Do not use path segments, `..`, or absolute paths. Omit `parameters.fixture` to use `dag_spec.provider.fixture` or the default `inventory_mock_v1.json`.
 
 #### 500 on POST /api/inventory/items:upsert
 

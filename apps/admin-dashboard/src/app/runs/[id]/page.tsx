@@ -109,13 +109,36 @@ export default function RunDetailPage({
   const logsScrollRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
 
+  type InventoryDelta = {
+    changed_skus_count?: number;
+    unchanged_skus_count?: number;
+    new_skus_count?: number;
+    removed_skus_count?: number;
+    removed_skus_sample?: string[];
+    new_out_of_stock_skus?: string[];
+    back_in_stock_skus?: string[];
+    quantity_changed_skus_count?: number;
+    top_deltas?: Array<{
+      sku: string;
+      previous_on_hand: number;
+      current_on_hand: number;
+      delta_on_hand: number;
+    }>;
+    total_on_hand_previous?: number;
+    total_on_hand_current?: number;
+    total_on_hand_delta?: number;
+  };
+
   type InventorySummary = {
     facility_id: string;
+    tenant_id?: string;
     provider: string;
+    fixture_used?: string;
     as_of: string | null;
     items_total: number;
     out_of_stock: number;
     out_of_stock_skus_sample: string[];
+    delta?: InventoryDelta | null;
   } | null;
 
   const [inventorySummary, setInventorySummary] = useState<InventorySummary>(null);
@@ -171,7 +194,7 @@ export default function RunDetailPage({
   }, [id, run?.status, fetchRun]);
 
   const fetchLogs = useCallback(async (runId: string) => {
-    const url = `${CP_BASE}/api/runs/${runId}/logs?limit=200&order=asc`;
+    const url = `${CP_BASE}/api/runs/${runId}/logs?limit=400&order=asc`;
     try {
       const res = await fetch(url);
       if (!res.ok) {
@@ -205,41 +228,78 @@ export default function RunDetailPage({
     return () => clearInterval(interval);
   }, [id, run?.status, fetchLogs]);
 
-  // Fetch latest inventory summary artifact (if any)
+  // Fetch latest inventory summary artifact (if any); poll while run is active
   useEffect(() => {
     if (!id) return;
-    const url = `${CP_BASE}/api/runs/${id}/artifacts?artifact_type=inventory_summary&order=desc&limit=1`;
-    fetch(url)
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        return res.json();
-      })
-      .then((data: { items?: { payload?: any }[] }) => {
-        const artifact = Array.isArray(data.items) && data.items.length > 0 ? data.items[0] : null;
-        if (artifact && artifact.payload && typeof artifact.payload === "object") {
-          const p = artifact.payload as any;
-          setInventorySummary({
-            facility_id: String(p.facility_id ?? ""),
-            provider: String(p.provider ?? ""),
-            as_of: typeof p.as_of === "string" ? p.as_of : null,
-            items_total: Number(p.items_total ?? 0),
-            out_of_stock: Number(p.out_of_stock ?? 0),
-            out_of_stock_skus_sample: Array.isArray(p.out_of_stock_skus_sample)
-              ? (p.out_of_stock_skus_sample as string[])
-              : [],
-          });
-          setInventorySummaryError(null);
-        } else {
+    const load = () => {
+      const url = `${CP_BASE}/api/runs/${id}/artifacts?artifact_type=inventory_summary&order=desc&limit=1`;
+      fetch(url)
+        .then((res) => {
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          return res.json();
+        })
+        .then((data: { items?: { payload?: Record<string, unknown> }[] }) => {
+          const artifact = Array.isArray(data.items) && data.items.length > 0 ? data.items[0] : null;
+          if (artifact && artifact.payload && typeof artifact.payload === "object") {
+            const p = artifact.payload;
+            const rawDelta = p.delta;
+            let delta: InventoryDelta | null | undefined;
+            if (rawDelta && typeof rawDelta === "object") {
+              const d = rawDelta as Record<string, unknown>;
+              delta = {
+                changed_skus_count: typeof d.changed_skus_count === "number" ? d.changed_skus_count : undefined,
+                unchanged_skus_count: typeof d.unchanged_skus_count === "number" ? d.unchanged_skus_count : undefined,
+                new_skus_count: typeof d.new_skus_count === "number" ? d.new_skus_count : undefined,
+                removed_skus_count: typeof d.removed_skus_count === "number" ? d.removed_skus_count : undefined,
+                removed_skus_sample: Array.isArray(d.removed_skus_sample)
+                  ? (d.removed_skus_sample as string[])
+                  : undefined,
+                new_out_of_stock_skus: Array.isArray(d.new_out_of_stock_skus)
+                  ? (d.new_out_of_stock_skus as string[])
+                  : undefined,
+                back_in_stock_skus: Array.isArray(d.back_in_stock_skus)
+                  ? (d.back_in_stock_skus as string[])
+                  : undefined,
+                quantity_changed_skus_count:
+                  typeof d.quantity_changed_skus_count === "number" ? d.quantity_changed_skus_count : undefined,
+                top_deltas: Array.isArray(d.top_deltas) ? (d.top_deltas as InventoryDelta["top_deltas"]) : undefined,
+                total_on_hand_previous:
+                  typeof d.total_on_hand_previous === "number" ? d.total_on_hand_previous : undefined,
+                total_on_hand_current:
+                  typeof d.total_on_hand_current === "number" ? d.total_on_hand_current : undefined,
+                total_on_hand_delta: typeof d.total_on_hand_delta === "number" ? d.total_on_hand_delta : undefined,
+              };
+            }
+            setInventorySummary({
+              facility_id: String(p.facility_id ?? ""),
+              tenant_id: typeof p.tenant_id === "string" ? p.tenant_id : undefined,
+              provider: String(p.provider ?? ""),
+              fixture_used: typeof p.fixture_used === "string" ? p.fixture_used : undefined,
+              as_of: typeof p.as_of === "string" ? p.as_of : null,
+              items_total: Number(p.items_total ?? 0),
+              out_of_stock: Number(p.out_of_stock ?? 0),
+              out_of_stock_skus_sample: Array.isArray(p.out_of_stock_skus_sample)
+                ? (p.out_of_stock_skus_sample as string[])
+                : [],
+              delta: delta ?? null,
+            });
+            setInventorySummaryError(null);
+          } else {
+            setInventorySummary(null);
+          }
+        })
+        .catch(() => {
           setInventorySummary(null);
-        }
-      })
-      .catch(() => {
-        setInventorySummary(null);
-        setInventorySummaryError("Could not load inventory summary");
-      });
-  }, [id]);
+          setInventorySummaryError("Could not load inventory summary");
+        });
+    };
+    load();
+    if (!run || TERMINAL_STATUSES.includes(run.status)) return;
+    const interval = setInterval(load, 2000);
+    return () => clearInterval(interval);
+  }, [id, run?.status]);
 
   // Fetch child retries (runs created from this run) for "Retries" section
   useEffect(() => {
@@ -506,52 +566,6 @@ export default function RunDetailPage({
         </dl>
       </section>
 
-      {/* Inventory Summary */}
-      <section className="mb-6">
-        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
-          Inventory Summary
-        </h2>
-        {inventorySummaryError && (
-          <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{inventorySummaryError}</p>
-        )}
-        {!inventorySummary && !inventorySummaryError ? (
-          <p className="text-sm text-gray-500">No inventory summary for this run yet.</p>
-        ) : inventorySummary ? (
-          <div className="rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 p-3 text-sm space-y-1">
-            <div>
-              <span className="text-gray-500 dark:text-gray-400">Facility:</span>{" "}
-              <span className="font-mono break-all">{inventorySummary.facility_id || "—"}</span>
-            </div>
-            <div>
-              <span className="text-gray-500 dark:text-gray-400">Provider:</span>{" "}
-              <span className="font-mono">{inventorySummary.provider || "—"}</span>
-            </div>
-            <div>
-              <span className="text-gray-500 dark:text-gray-400">As of:</span>{" "}
-              <span>{inventorySummary.as_of ? formatDate(inventorySummary.as_of) : "—"}</span>
-            </div>
-            <div>
-              <span className="text-gray-500 dark:text-gray-400">Items total:</span>{" "}
-              <span className="font-mono">{inventorySummary.items_total}</span>
-            </div>
-            <div>
-              <span className="text-gray-500 dark:text-gray-400">Out of stock:</span>{" "}
-              <span className="font-mono">{inventorySummary.out_of_stock}</span>
-            </div>
-            <div>
-              <span className="text-gray-500 dark:text-gray-400">Sample OOS SKUs:</span>{" "}
-              {inventorySummary.out_of_stock_skus_sample.length === 0 ? (
-                <span className="font-mono text-gray-500">—</span>
-              ) : (
-                <span className="font-mono">
-                  {inventorySummary.out_of_stock_skus_sample.join(", ")}
-                </span>
-              )}
-            </div>
-          </div>
-        ) : null}
-      </section>
-
       {/* Error callout */}
       {(r.status === "FAILED" || (r.error_message != null && r.error_message !== "")) && (
         <section className="mb-6">
@@ -591,6 +605,185 @@ export default function RunDetailPage({
         )}
       </section>
 
+      {/* Inventory Summary — after parameters so operators see inputs, outputs, then trace */}
+      <section className="mb-6">
+        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Inventory Summary
+        </h2>
+        {inventorySummaryError && (
+          <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{inventorySummaryError}</p>
+        )}
+        {!inventorySummary && !inventorySummaryError ? (
+          <p className="text-sm text-gray-500">No inventory summary for this run yet.</p>
+        ) : inventorySummary ? (
+          <div className="rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 p-3 text-sm space-y-3">
+            <div className="space-y-1">
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">Facility:</span>{" "}
+                <span className="font-mono break-all">{inventorySummary.facility_id || "—"}</span>
+              </div>
+              {inventorySummary.tenant_id != null && inventorySummary.tenant_id !== "" && (
+                <div>
+                  <span className="text-gray-500 dark:text-gray-400">Tenant:</span>{" "}
+                  <span className="font-mono break-all">{inventorySummary.tenant_id}</span>
+                </div>
+              )}
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">Provider:</span>{" "}
+                <span className="font-mono">{inventorySummary.provider || "—"}</span>
+              </div>
+              {inventorySummary.fixture_used != null && inventorySummary.fixture_used !== "" && (
+                <div>
+                  <span className="text-gray-500 dark:text-gray-400">Fixture used:</span>{" "}
+                  <span className="font-mono">{inventorySummary.fixture_used}</span>
+                </div>
+              )}
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">As of:</span>{" "}
+                <span>{inventorySummary.as_of ? formatDate(inventorySummary.as_of) : "—"}</span>
+              </div>
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">Items total:</span>{" "}
+                <span className="font-mono">{inventorySummary.items_total}</span>
+              </div>
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">Out of stock:</span>{" "}
+                <span className="font-mono">{inventorySummary.out_of_stock}</span>
+              </div>
+              <div>
+                <span className="text-gray-500 dark:text-gray-400">Sample OOS SKUs:</span>{" "}
+                {inventorySummary.out_of_stock_skus_sample.length === 0 ? (
+                  <span className="font-mono text-gray-500">—</span>
+                ) : (
+                  <span className="font-mono">
+                    {inventorySummary.out_of_stock_skus_sample.join(", ")}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {inventorySummary.delta != null &&
+              (typeof inventorySummary.delta.changed_skus_count === "number" ||
+                typeof inventorySummary.delta.new_skus_count === "number" ||
+                typeof inventorySummary.delta.removed_skus_count === "number") && (
+                <div className="border-t border-gray-200 dark:border-gray-700 pt-3 space-y-2">
+                  <p className="text-xs font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wide">
+                    Change vs prior canonical state
+                  </p>
+                  <dl className="grid grid-cols-[minmax(10rem,auto)_1fr] gap-x-2 gap-y-1">
+                    <dt className="text-gray-500 dark:text-gray-400">Changed SKUs</dt>
+                    <dd className="font-mono">
+                      {inventorySummary.delta.changed_skus_count ?? "—"}
+                    </dd>
+                    <dt className="text-gray-500 dark:text-gray-400">Unchanged SKUs</dt>
+                    <dd className="font-mono">
+                      {inventorySummary.delta.unchanged_skus_count ?? "—"}
+                    </dd>
+                    <dt className="text-gray-500 dark:text-gray-400">New SKUs</dt>
+                    <dd className="font-mono">{inventorySummary.delta.new_skus_count ?? "—"}</dd>
+                    <dt className="text-gray-500 dark:text-gray-400">Removed SKUs</dt>
+                    <dd className="font-mono">
+                      {inventorySummary.delta.removed_skus_count ?? "—"}
+                      {Array.isArray(inventorySummary.delta.removed_skus_sample) &&
+                        inventorySummary.delta.removed_skus_sample.length > 0 && (
+                          <span className="text-gray-500 dark:text-gray-400 ml-1">
+                            ({inventorySummary.delta.removed_skus_sample.join(", ")})
+                          </span>
+                        )}
+                    </dd>
+                    <dt className="text-gray-500 dark:text-gray-400">On-hand qty changed</dt>
+                    <dd className="font-mono">
+                      {inventorySummary.delta.quantity_changed_skus_count ?? "—"}
+                    </dd>
+                    {(typeof inventorySummary.delta.total_on_hand_previous === "number" ||
+                      typeof inventorySummary.delta.total_on_hand_current === "number") && (
+                      <>
+                        <dt className="text-gray-500 dark:text-gray-400">Total on-hand (prev → curr)</dt>
+                        <dd className="font-mono">
+                          {typeof inventorySummary.delta.total_on_hand_previous === "number"
+                            ? inventorySummary.delta.total_on_hand_previous
+                            : "—"}
+                          {" → "}
+                          {typeof inventorySummary.delta.total_on_hand_current === "number"
+                            ? inventorySummary.delta.total_on_hand_current
+                            : "—"}
+                          {typeof inventorySummary.delta.total_on_hand_delta === "number" && (
+                            <span
+                              className={
+                                inventorySummary.delta.total_on_hand_delta === 0
+                                  ? "text-gray-600 dark:text-gray-400"
+                                  : inventorySummary.delta.total_on_hand_delta > 0
+                                    ? "text-green-700 dark:text-green-400"
+                                    : "text-amber-800 dark:text-amber-300"
+                              }
+                            >
+                              {" "}
+                              (Δ {inventorySummary.delta.total_on_hand_delta > 0 ? "+" : ""}
+                              {inventorySummary.delta.total_on_hand_delta})
+                            </span>
+                          )}
+                        </dd>
+                      </>
+                    )}
+                  </dl>
+
+                  <div>
+                    <span className="text-gray-500 dark:text-gray-400">Newly out of stock (sample):</span>{" "}
+                    {Array.isArray(inventorySummary.delta.new_out_of_stock_skus) &&
+                    inventorySummary.delta.new_out_of_stock_skus.length > 0 ? (
+                      <span className="font-mono">
+                        {inventorySummary.delta.new_out_of_stock_skus.join(", ")}
+                      </span>
+                    ) : (
+                      <span className="text-gray-500 text-xs">No newly out-of-stock SKUs</span>
+                    )}
+                  </div>
+                  <div>
+                    <span className="text-gray-500 dark:text-gray-400">Back in stock (sample):</span>{" "}
+                    {Array.isArray(inventorySummary.delta.back_in_stock_skus) &&
+                    inventorySummary.delta.back_in_stock_skus.length > 0 ? (
+                      <span className="font-mono">
+                        {inventorySummary.delta.back_in_stock_skus.join(", ")}
+                      </span>
+                    ) : (
+                      <span className="text-gray-500 text-xs">No back-in-stock SKUs</span>
+                    )}
+                  </div>
+
+                  {Array.isArray(inventorySummary.delta.top_deltas) &&
+                    inventorySummary.delta.top_deltas.length > 0 && (
+                      <div>
+                        <p className="text-gray-500 dark:text-gray-400 mb-1">Top on-hand deltas</p>
+                        <ul className="font-mono text-xs space-y-0.5 list-disc list-inside pl-1">
+                          {inventorySummary.delta.top_deltas.map((row) => (
+                            <li key={row.sku}>
+                              <span className="text-gray-700 dark:text-gray-200">{row.sku}</span>
+                              {" — "}
+                              {row.previous_on_hand} → {row.current_on_hand}
+                              {" "}
+                              <span
+                                className={
+                                  row.delta_on_hand === 0
+                                    ? "text-gray-500"
+                                    : row.delta_on_hand > 0
+                                      ? "text-green-700 dark:text-green-400"
+                                      : "text-amber-800 dark:text-amber-300"
+                                }
+                              >
+                                ({row.delta_on_hand > 0 ? "+" : ""}
+                                {row.delta_on_hand})
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                </div>
+              )}
+          </div>
+        ) : null}
+      </section>
+
       {/* Logs */}
       <section className="mb-6">
         <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
@@ -615,22 +808,28 @@ export default function RunDetailPage({
           {logs.length === 0 && !logsError ? (
             <p className="p-3 text-gray-500">No logs yet.</p>
           ) : (
-            <div className="p-2 space-y-1">
+            <div className="p-2 space-y-2">
               {logs.map((entry) => (
-                <div
-                  key={entry.id}
-                  className="flex gap-2 items-baseline break-words"
-                >
-                  <span className="text-gray-500 dark:text-gray-400 shrink-0" title={entry.ts}>
-                    {formatDate(entry.ts)}
-                  </span>
-                  <span className={logLevelBadgeClass(entry.level)}>{entry.level}</span>
-                  {entry.source && (
-                    <span className="text-gray-500 dark:text-gray-400 shrink-0">
-                      [{entry.source}]
+                <div key={entry.id} className="min-w-0">
+                  <div className="flex gap-2 items-baseline break-words">
+                    <span className="text-gray-500 dark:text-gray-400 shrink-0" title={entry.ts}>
+                      {formatDate(entry.ts)}
                     </span>
-                  )}
-                  <span className="min-w-0">{entry.message}</span>
+                    <span className={logLevelBadgeClass(entry.level)}>{entry.level}</span>
+                    {entry.source && (
+                      <span className="text-gray-500 dark:text-gray-400 shrink-0">
+                        [{entry.source}]
+                      </span>
+                    )}
+                    <span className="min-w-0">{entry.message}</span>
+                  </div>
+                  {entry.meta != null &&
+                    typeof entry.meta === "object" &&
+                    Object.keys(entry.meta).length > 0 && (
+                      <div className="pl-0 sm:pl-36 mt-0.5 text-[10px] leading-snug text-gray-500 dark:text-gray-500 opacity-90 break-all font-mono">
+                        {JSON.stringify(entry.meta)}
+                      </div>
+                    )}
                 </div>
               ))}
               <div ref={logsEndRef} />

@@ -97,7 +97,7 @@ def upsert_inventory_items(body: InventoryItemsUpsertIn, db: Session = Depends(g
 def list_inventory_items(
     facility_id: str,
     tenant_id: str | None = None,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):

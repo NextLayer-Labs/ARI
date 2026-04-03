@@ -1,0 +1,9 @@
+{
+  "as_of": "2026-03-02T00:00:00Z",
+  "items": [
+    { "sku": "SKU1", "on_hand": 2, "available": 2, "reserved": 0 },
+    { "sku": "SKU2", "on_hand": 5, "available": 5, "reserved": 0 },
+    { "sku": "SKU3", "on_hand": 0, "available": 0, "reserved": 0 },
+    { "sku": "SKU4", "on_hand": 100, "available": 100, "reserved": 0 }
+  ]
+}
