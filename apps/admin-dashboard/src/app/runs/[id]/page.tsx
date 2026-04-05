@@ -34,6 +34,10 @@ function shortId(id: string, len = 8): string {
   return id.length > len ? `${id.slice(0, len)}…` : id;
 }
 
+function facilityInventoryHref(facilityId: string, tenantId: string): string {
+  return `/inventory/${encodeURIComponent(facilityId)}?tenant_id=${encodeURIComponent(tenantId)}`;
+}
+
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
   try {
@@ -143,6 +147,21 @@ export default function RunDetailPage({
 
   const [inventorySummary, setInventorySummary] = useState<InventorySummary>(null);
   const [inventorySummaryError, setInventorySummaryError] = useState<string | null>(null);
+
+  type RawIngestRow = {
+    id: string;
+    run_id: string;
+    tenant_id?: string;
+    facility_id?: string;
+    provider: string;
+    mapping_version: string;
+    fetched_at: string | null;
+    as_of: string | null;
+    payload: Record<string, unknown>;
+  };
+  const [rawIngestRows, setRawIngestRows] = useState<RawIngestRow[]>([]);
+  const [rawIngestsError, setRawIngestsError] = useState<string | null>(null);
+  const [rawPayloadOpenId, setRawPayloadOpenId] = useState<string | null>(null);
 
   const fetchRun = useCallback(async (runId: string) => {
     const url = `${CP_BASE}/api/runs/${runId}`;
@@ -301,6 +320,41 @@ export default function RunDetailPage({
     return () => clearInterval(interval);
   }, [id, run?.status]);
 
+  // Raw ingests (audit / replay); refetch while run is active in case worker writes mid-flight
+  useEffect(() => {
+    if (!id) return;
+    const load = () => {
+      fetch(`${CP_BASE}/api/runs/${encodeURIComponent(id)}/raw-ingests?limit=20`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        })
+        .then(
+          (data: {
+            items?: RawIngestRow[];
+            found?: boolean;
+            ok?: boolean;
+          }) => {
+            if (data && data.ok === false) {
+              setRawIngestRows([]);
+              setRawIngestsError(null);
+              return;
+            }
+            setRawIngestRows(Array.isArray(data.items) ? data.items : []);
+            setRawIngestsError(null);
+          },
+        )
+        .catch(() => {
+          setRawIngestRows([]);
+          setRawIngestsError("Could not load raw ingests");
+        });
+    };
+    load();
+    if (!run || TERMINAL_STATUSES.includes(run.status)) return;
+    const interval = setInterval(load, 4000);
+    return () => clearInterval(interval);
+  }, [id, run?.status]);
+
   // Fetch child retries (runs created from this run) for "Retries" section
   useEffect(() => {
     if (!id) return;
@@ -392,6 +446,16 @@ export default function RunDetailPage({
       : "";
   const paramsLarge = paramsStr.length > 500;
 
+  const paramFacilityId =
+    r.parameters != null &&
+    typeof r.parameters === "object" &&
+    typeof (r.parameters as Record<string, unknown>).facility_id === "string"
+      ? ((r.parameters as Record<string, unknown>).facility_id as string)
+      : null;
+  const displayFacilityId = inventorySummary?.facility_id || paramFacilityId;
+  const facilityViewHref =
+    displayFacilityId && r.tenant_id ? facilityInventoryHref(displayFacilityId, r.tenant_id) : null;
+
   return (
     <main className="p-6 max-w-3xl mx-auto">
       <Link
@@ -447,6 +511,16 @@ export default function RunDetailPage({
             </>
           )}
         </dl>
+        {facilityViewHref && (
+          <p className="mt-3 text-sm">
+            <Link
+              href={facilityViewHref}
+              className="text-blue-600 dark:text-blue-400 hover:underline"
+            >
+              View facility inventory →
+            </Link>
+          </p>
+        )}
       </section>
 
       {/* Retries (child runs created from this run) */}
@@ -620,7 +694,17 @@ export default function RunDetailPage({
             <div className="space-y-1">
               <div>
                 <span className="text-gray-500 dark:text-gray-400">Facility:</span>{" "}
-                <span className="font-mono break-all">{inventorySummary.facility_id || "—"}</span>
+                {facilityViewHref ? (
+                  <Link
+                    href={facilityViewHref}
+                    className="font-mono break-all text-blue-600 dark:text-blue-400 hover:underline"
+                    title="View facility inventory"
+                  >
+                    {displayFacilityId}
+                  </Link>
+                ) : (
+                  <span className="font-mono break-all">{displayFacilityId || inventorySummary.facility_id || "—"}</span>
+                )}
               </div>
               {inventorySummary.tenant_id != null && inventorySummary.tenant_id !== "" && (
                 <div>
@@ -782,6 +866,53 @@ export default function RunDetailPage({
               )}
           </div>
         ) : null}
+      </section>
+
+      {/* Raw ingests */}
+      <section className="mb-6">
+        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Raw ingests
+        </h2>
+        {rawIngestsError && (
+          <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{rawIngestsError}</p>
+        )}
+        {rawIngestRows.length === 0 && !rawIngestsError ? (
+          <p className="text-sm text-gray-500">No raw ingest rows for this run.</p>
+        ) : (
+          <div className="space-y-2">
+            {rawIngestRows.map((row) => (
+              <div
+                key={row.id}
+                className="rounded border border-gray-200 dark:border-gray-700 text-sm overflow-hidden"
+              >
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 bg-gray-50 dark:bg-gray-900/40">
+                  <span className="text-gray-500 dark:text-gray-400">{formatDate(row.fetched_at)}</span>
+                  <span className="font-mono text-xs">{row.provider}</span>
+                  <span className="text-gray-500 text-xs">map {row.mapping_version}</span>
+                  {row.as_of && (
+                    <span className="text-xs text-gray-500" title="as_of">
+                      as_of {formatDate(row.as_of)}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setRawPayloadOpenId((x) => (x === row.id ? null : row.id))
+                    }
+                    className="text-xs text-blue-600 dark:text-blue-400 hover:underline ml-auto"
+                  >
+                    {rawPayloadOpenId === row.id ? "Hide payload" : "View payload"}
+                  </button>
+                </div>
+                {rawPayloadOpenId === row.id && (
+                  <pre className="p-3 text-xs overflow-x-auto max-h-64 overflow-y-auto bg-gray-100 dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700">
+                    {JSON.stringify(row.payload ?? {}, null, 2)}
+                  </pre>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </section>
 
       {/* Logs */}

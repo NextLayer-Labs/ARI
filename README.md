@@ -296,6 +296,7 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 #### Registry Endpoints (`/api/*`)
 
 - `POST /api/tenants` - Create tenant
+- `GET /api/facilities` - List facilities (`tenant_id` required; limit/offset)
 - `POST /api/facilities` - Create facility
 - `POST /api/connector-instances` - Create connector instance
 - `POST /api/pipelines` - Create pipeline
@@ -319,6 +320,7 @@ The following SQLAlchemy models are defined in `app/models/core.py`:
 - `POST /api/runs/{id}/artifacts` - Create a JSON artifact for a run (e.g., inventory summary)
 - `GET /api/runs/{id}/artifacts` - List artifacts for a run (optional filters: artifact_type, limit, order)
 - `POST /api/runs/{id}/raw-ingests` - Append a raw ingest row (jsonb payload) for a run
+- `GET /api/runs/{id}/raw-ingests` - List raw ingests for a run (newest first; limit)
 
 **Retry lineage:** Runs created via Retry store `retry_of_run_id` (parent run) and `root_run_id` (root of the retry chain). The dashboard run detail page shows “Retry of” (link to parent) and “Retries” (child runs). Use `GET /api/runs?retry_of_run_id=<run_id>` to list child retries.
 
@@ -552,7 +554,25 @@ The dashboard will be available at `http://localhost:3000`
   - items_total, out_of_stock, sample OOS SKUs
   - When the artifact includes `delta` (newer worker): change counts (changed / unchanged / new / removed), on-hand quantity changes, optional total on-hand prev→curr, samples for newly OOS and back-in-stock SKUs, and top on-hand deltas
 - **Logs** show optional `meta` JSON under each line when present (step metadata from the data-plane worker).
-- Section order on the page: … → Parameters → **Inventory Summary** → Logs (outputs sit next to the execution trace).
+- Section order on the page: … → Parameters → **Inventory Summary** → **Raw ingests** (rows for this run; expand JSON) → Logs (outputs sit next to the execution trace).
+- **Facility inventory**: When `parameters.facility_id` or the inventory summary artifact includes a facility ID, **Identity** shows a link to **`/inventory/[facilityId]?tenant_id=...`**. The facility ID in the **Inventory Summary** card is also clickable when the tenant is known.
+
+#### `/inventory` - Facility inventory (home)
+
+- Enter a **tenant ID** to load facilities via `GET /api/facilities` and open **`/inventory/[facilityId]?tenant_id=...`** for each row.
+- Optionally paste a facility UUID with tenant ID to jump directly.
+
+#### `/inventory/[facilityId]` - Facility inventory (detail)
+
+- **Query:** `tenant_id` (required) — must match the facility’s tenant.
+- **Page layout (top to bottom):** current canonical **summary** → canonical **inventory table** (not artifacts) → **Latest snapshot insight** (from newest facility-history row / `inventory_summary` when present) → **Recent inventory snapshot runs** (same API; links to run detail) → **Raw ingests (recent)** for the facility (`GET /api/inventory/raw-ingests`).
+- **Current state (canonical):** `GET /api/inventory/facility-summary` — SKU count, total on-hand, OOS count (same rule as the worker), latest `as_of`.
+- **Inventory table:** `GET /api/inventory/items` with pagination; optional **Out of stock only** (`oos_only=true`).
+- **Latest snapshot insight:** Derived from the most recent row in facility history (artifact fields when present).
+- **Recent inventory snapshot runs:** `GET /api/inventory/facility-history` — `inventory_snapshot_v0` runs whose `parameters.facility_id` matches this facility, newest first; includes flattened `inventory_summary` fields when available (older artifacts without `delta` still list; missing artifact → graceful blanks).
+- Links to **`/runs/[id]`** from history, raw-ingest rows, and from canonical `source_run_id`.
+
+**Data sources:** Canonical summary/table come from **`canonical_inventory_items`** via `facility-summary` + `items`. Snapshot insight and the history table come from **run rows** + optional **`inventory_summary` artifacts** (not from canonical rows). Raw ingest list comes from **`pipeline_run_raw_ingests`**.
 
 #### `/pipeline-versions` - Pipeline Versions List
 
@@ -953,6 +973,21 @@ Write-Host "Run 2: $run2Id — open http://localhost:3000/runs/$run2Id for delta
 ```
 
 **Dashboard:** On an **APPROVED** `inventory_snapshot_v0` version, use **Run** / **Trigger run** and pass parameters JSON, e.g. `{ "facility_id": "<uuid>" }` then `{ "facility_id": "<same>", "fixture": "inventory_mock_v2.json" }`. **Retry** on a finished run pre-fills parameters so you can edit the fixture for a new run.
+
+**Facility inventory UI (after run 2 is `SUCCEEDED`):**
+
+1. Open `http://localhost:3000/runs/<run2_id>` (the second run’s UUID from the script, e.g. `$run2Id`) — use **View facility inventory →** (Identity) or click **Facility** in Inventory Summary — confirm `/inventory/<facility_id>?tenant_id=...`.
+2. Or open `http://localhost:3000/inventory`, paste `$tenantId`, pick the facility → **View inventory**.
+3. On the facility page confirm: canonical summary + table, latest snapshot card, history table (two runs), raw ingests list with payloads.
+
+**API checks (PowerShell, optional):**
+
+```powershell
+Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/facility-summary?facility_id=$facilityId&tenant_id=$tenantId"
+Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/facility-history?facility_id=$facilityId&tenant_id=$tenantId&limit=10"
+Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/raw-ingests?facility_id=$facilityId&tenant_id=$tenantId&limit=5"
+Invoke-RestMethod -Uri "http://localhost:8000/api/runs/$run2Id/raw-ingests?limit=10"
+```
 
 ### Step 2: Create a Run
 
@@ -1544,6 +1579,7 @@ List canonical inventory items for a facility (optionally filtered by tenant).
 - `tenant_id` (optional)
 - `limit` (default 50, max 500)
 - `offset` (default 0)
+- `oos_only` (optional boolean) — only rows considered out of stock: `(available <= 0 if set) else (on_hand <= 0)`
 
 **Response:** `200 OK`
 ```json
@@ -1568,6 +1604,62 @@ List canonical inventory items for a facility (optionally filtered by tenant).
   "count": 1
 }
 ```
+
+#### GET /api/inventory/facility-summary
+
+Aggregates canonical inventory for one facility (operator UI). Requires the facility to exist under the tenant.
+
+**Query:** `facility_id`, `tenant_id` (both required)
+
+**Response:** `200 OK`
+```json
+{
+  "facility_id": "facility-uuid",
+  "tenant_id": "tenant-uuid",
+  "sku_count": 12,
+  "total_on_hand": 340,
+  "out_of_stock_count": 2,
+  "latest_as_of": "2026-03-02T00:00:00+00:00"
+}
+```
+
+**Errors:** `404` if facility not found for that tenant.
+
+#### GET /api/inventory/facility-history
+
+Recent `inventory_snapshot_v0` runs for a facility: joins `pipeline_runs` to `pipeline_versions` on `dag_spec.kind`, filters `parameters.facility_id` (JSON) to the given facility. Newest first. Flattens the latest `inventory_summary` artifact per run when present (partial / legacy payloads are OK).
+
+**Query:** `tenant_id`, `facility_id` (required), `limit` (default 30, max 100)
+
+**Response:** `{ "items": [ { "run_id", "pipeline_version_id", "status", "trigger_type", "created_at", "finished_at", "artifact_present", "fixture_used", "items_total", "out_of_stock", "changed_skus_count", "new_skus_count", "new_out_of_stock_count", "back_in_stock_count", "top_deltas_sample" } ], "count", "limit" }`
+
+Note: `new_out_of_stock_count` / `back_in_stock_count` are derived from **sample array lengths** in `payload.delta` when present (MVP), not full population counts.
+
+**Errors:** `404` if facility not found for that tenant.
+
+#### GET /api/inventory/raw-ingests
+
+Recent raw ingest rows for a **facility** (all runs), newest `fetched_at` first. Requires the facility to exist for the tenant. Same row shape as `GET /api/runs/{id}/raw-ingests` (includes `payload`). Use for operator audit without picking a run first.
+
+**Query:** `tenant_id`, `facility_id` (required), `limit` (default 50, max 100)
+
+**Response:** `{ "items": [ { "id", "run_id", "tenant_id", "facility_id", "provider", "mapping_version", "fetched_at", "as_of", "payload" } ], "count", "limit" }`
+
+**Errors:** `404` if facility not found for that tenant.
+
+#### GET /api/facilities
+
+**Query:** `tenant_id` (required), `limit`, `offset`
+
+**Response:** `{ "items": [ { "id", "tenant_id", "name", "facility_type", "timezone", "created_at" } ], "count", "limit", "offset" }`
+
+#### GET /api/runs/{id}/raw-ingests
+
+Lists raw ingest rows for a run (newest first). Same path prefix as POST; used for audit/replay.
+
+**Query:** `limit` (default 50, max 100)
+
+**Response:** `{ "found": true, "run_id", "items": [ { "id", "run_id", "tenant_id", "facility_id", "provider", "mapping_version", "fetched_at", "as_of", "payload" } ], "limit" }`
 
 ---
 

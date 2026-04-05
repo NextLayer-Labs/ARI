@@ -615,6 +615,41 @@ def create_run_raw_ingest(run_id: str, body: RawIngestCreateIn, db: Session = De
     return {"ok": True, "raw_ingest": out}
 
 
+@router.get("/{run_id}/raw-ingests")
+def list_run_raw_ingests(
+    run_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """List raw ingest rows for a run (newest first). Operator audit / replay."""
+    run = _run_exists(db, run_id)
+    if run is None:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "reason": "run_not_found"},
+        )
+    rows = db.execute(
+        text(
+            """
+            SELECT id, run_id, tenant_id, facility_id, provider, mapping_version, fetched_at, as_of, payload
+            FROM pipeline_run_raw_ingests
+            WHERE run_id = :run_id
+            ORDER BY fetched_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"run_id": run_id, "limit": limit},
+    ).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        for key in ("fetched_at", "as_of"):
+            if d.get(key) is not None and hasattr(d[key], "isoformat"):
+                d[key] = d[key].isoformat()
+        items.append(d)
+    return {"found": True, "run_id": run_id, "items": items, "limit": limit}
+
+
 @router.post("/{run_id}/artifacts")
 def create_run_artifact(run_id: str, body: RunArtifactCreateIn, db: Session = Depends(get_db)):
     run = _run_exists(db, run_id)

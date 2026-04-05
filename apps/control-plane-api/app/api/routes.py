@@ -24,6 +24,44 @@ def create_tenant(body: TenantCreate, db: Session = Depends(get_db)):
     db.refresh(t)
     return TenantOut(id=t.id, name=t.name)
 
+@router.get("/facilities")
+def list_facilities(
+    tenant_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """List facilities for a tenant (operator navigation)."""
+    if not db.get(Tenant, tenant_id):
+        raise HTTPException(404, "tenant not found")
+    total = (
+        db.execute(
+            text("SELECT COUNT(*) FROM facilities WHERE tenant_id = :tenant_id"),
+            {"tenant_id": tenant_id},
+        ).scalar()
+        or 0
+    )
+    rows = db.execute(
+        text(
+            """
+            SELECT id, tenant_id, name, facility_type, timezone, created_at
+            FROM facilities
+            WHERE tenant_id = :tenant_id
+            ORDER BY name ASC
+            LIMIT :limit OFFSET :offset
+            """
+        ),
+        {"tenant_id": tenant_id, "limit": limit, "offset": offset},
+    ).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        if d.get("created_at") is not None and hasattr(d["created_at"], "isoformat"):
+            d["created_at"] = d["created_at"].isoformat()
+        items.append(d)
+    return {"items": items, "count": total, "limit": limit, "offset": offset}
+
+
 @router.post("/facilities", response_model=FacilityOut)
 def create_facility(body: FacilityCreate, db: Session = Depends(get_db)):
     tenant = db.get(Tenant, body.tenant_id)
