@@ -180,3 +180,24 @@ class InventoryItemsUpsertIn(BaseModel):
     source_run_id: str
     as_of: Optional[str] = None
     items: list[InventoryItemUpsert]
+
+
+class ReturnItemUpsert(BaseModel):
+    return_id: str
+    order_id: Optional[str] = None
+    sku: str
+    quantity: int
+    status: str
+    reason_code: Optional[str] = None
+    created_at_source: Optional[str] = None
+    updated_at_source: Optional[str] = None
+    received_at: Optional[str] = None
+    processed_at: Optional[str] = None
+    disposition: Optional[str] = None
+
+
+class ReturnItemsUpsertIn(BaseModel):
+    facility_id: str
+    source_provider: str
+    source_run_id: str
+    items: list[ReturnItemUpsert]

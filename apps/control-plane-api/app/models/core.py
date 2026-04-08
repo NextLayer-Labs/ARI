@@ -164,3 +164,25 @@ class CanonicalInventoryItem(Base):
     source_provider: Mapped[str] = mapped_column(Text, nullable=False)
     source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     source_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class CanonicalReturnItem(Base):
+    __tablename__ = "canonical_return_items"
+    tenant_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    facility_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    return_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    order_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sku: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[int] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at_source: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at_source: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    disposition: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_provider: Mapped[str] = mapped_column(Text, nullable=False)
+    source_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

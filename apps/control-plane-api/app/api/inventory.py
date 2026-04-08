@@ -8,6 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.api.schemas import InventoryItemsUpsertIn
+from app.api.inventory_logic import InventorySnapshotError, compare_inventory_runs
 from app.db.deps import get_db
 
 
@@ -368,4 +369,62 @@ def list_facility_raw_ingests(
                 d[key] = d[key].isoformat()
         items.append(d)
     return {"items": items, "count": len(items), "limit": limit}
+
+
+@router.get("/compare-runs")
+def compare_inventory_snapshot_runs(
+    tenant_id: str,
+    run_id_a: str,
+    run_id_b: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Compare two inventory_snapshot_v0 runs for the same tenant and facility.
+    Per-SKU diff is derived from each run's latest raw ingest fixture (not current canonical).
+    """
+    try:
+        return compare_inventory_runs(db, tenant_id, run_id_a, run_id_b)
+    except InventorySnapshotError as e:
+        raise HTTPException(
+            status_code=e.status_code,
+            detail={"reason": e.reason, "message": e.message},
+        ) from e
+
+
+@router.get("/approved-snapshot-versions")
+def list_approved_inventory_snapshot_versions(
+    tenant_id: str,
+    db: Session = Depends(get_db),
+):
+    """APPROVED pipeline versions with dag_spec.kind = inventory_snapshot_v0 (newest first)."""
+    ok = db.execute(
+        text("SELECT 1 FROM tenants WHERE id = :id LIMIT 1"),
+        {"id": tenant_id},
+    ).scalar()
+    if not ok:
+        raise HTTPException(status_code=404, detail="tenant_not_found")
+
+    rows = db.execute(
+        text(
+            """
+            SELECT pv.id, pv.pipeline_id, pv.version, pv.created_at, p.name AS pipeline_name
+            FROM pipeline_versions pv
+            LEFT JOIN pipelines p ON p.id = pv.pipeline_id
+            WHERE pv.tenant_id = :tenant_id
+              AND pv.status = 'APPROVED'
+              AND (pv.dag_spec->>'kind') = 'inventory_snapshot_v0'
+            ORDER BY pv.created_at DESC
+            LIMIT 50
+            """
+        ),
+        {"tenant_id": tenant_id},
+    ).mappings().all()
+    items = []
+    for r in rows:
+        d = dict(r)
+        ca = d.get("created_at")
+        if ca is not None and hasattr(ca, "isoformat"):
+            d["created_at"] = ca.isoformat()
+        items.append(d)
+    return {"items": items, "count": len(items)}
 

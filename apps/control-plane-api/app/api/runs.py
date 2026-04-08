@@ -16,6 +16,7 @@ from app.api.schemas import (
     HeartbeatIn,
     ReapStaleIn,
 )
+from app.api.inventory_logic import InventorySnapshotError, build_run_inventory_snapshot
 from app.db.deps import get_db
 from app.models.core import PipelineRun, PipelineVersion
 
@@ -648,6 +649,22 @@ def list_run_raw_ingests(
                 d[key] = d[key].isoformat()
         items.append(d)
     return {"found": True, "run_id": run_id, "items": items, "limit": limit}
+
+
+@router.get("/{run_id}/inventory-snapshot")
+def get_run_inventory_snapshot(run_id: str, db: Session = Depends(get_db)):
+    """
+    Normalized inventory rows from this run's latest raw ingest fixture (inventory_snapshot_v0).
+    Not the live canonical table; use for audit and run-to-run comparison.
+    """
+    try:
+        data = build_run_inventory_snapshot(db, run_id)
+    except InventorySnapshotError as e:
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"ok": False, "reason": e.reason, "message": e.message},
+        )
+    return {"ok": True, **data}
 
 
 @router.post("/{run_id}/artifacts")

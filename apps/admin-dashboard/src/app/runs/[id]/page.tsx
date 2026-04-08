@@ -37,6 +37,9 @@ function shortId(id: string, len = 8): string {
 function facilityInventoryHref(facilityId: string, tenantId: string): string {
   return `/inventory/${encodeURIComponent(facilityId)}?tenant_id=${encodeURIComponent(tenantId)}`;
 }
+function facilityReturnsHref(facilityId: string, tenantId: string): string {
+  return `/returns/${encodeURIComponent(facilityId)}?tenant_id=${encodeURIComponent(tenantId)}`;
+}
 
 function formatDate(iso: string | null): string {
   if (!iso) return "—";
@@ -147,6 +150,21 @@ export default function RunDetailPage({
 
   const [inventorySummary, setInventorySummary] = useState<InventorySummary>(null);
   const [inventorySummaryError, setInventorySummaryError] = useState<string | null>(null);
+  type ReturnsSummary = {
+    facility_id: string;
+    provider: string;
+    fixture_used?: string;
+    as_of: string | null;
+    returns_count: number;
+    total_units: number;
+    pending_count: number;
+    received_count: number;
+    processed_count: number;
+    needs_attention_count: number;
+    pending_return_ids_sample?: string[];
+    aging_return_ids_sample?: string[];
+  } | null;
+  const [returnsSummary, setReturnsSummary] = useState<ReturnsSummary>(null);
 
   type RawIngestRow = {
     id: string;
@@ -162,6 +180,44 @@ export default function RunDetailPage({
   const [rawIngestRows, setRawIngestRows] = useState<RawIngestRow[]>([]);
   const [rawIngestsError, setRawIngestsError] = useState<string | null>(null);
   const [rawPayloadOpenId, setRawPayloadOpenId] = useState<string | null>(null);
+  const [inventorySummaryRawPayload, setInventorySummaryRawPayload] = useState<Record<
+    string,
+    unknown
+  > | null>(null);
+  const [summaryJsonOpen, setSummaryJsonOpen] = useState(false);
+
+  type ArtifactRow = {
+    id: string;
+    artifact_type: string;
+    created_at: string;
+    payload: Record<string, unknown>;
+    source: string | null;
+    meta: unknown;
+  };
+  const [runArtifacts, setRunArtifacts] = useState<ArtifactRow[]>([]);
+  const [artifactsError, setArtifactsError] = useState<string | null>(null);
+  const [artifactPayloadOpenId, setArtifactPayloadOpenId] = useState<string | null>(null);
+
+  type InvSnapOk = {
+    ok: true;
+    run_id: string;
+    tenant_id: string;
+    facility_id: string;
+    status: string;
+    as_of: string | null;
+    provider: string | null;
+    mapping_version: string | null;
+    count: number;
+    items: Array<{
+      sku: string;
+      on_hand: number;
+      available: number | null;
+      reserved: number | null;
+    }>;
+    summary_artifact_present: boolean;
+  };
+  const [invSnapshot, setInvSnapshot] = useState<InvSnapOk | null>(null);
+  const [invSnapshotReason, setInvSnapshotReason] = useState<string | null>(null);
 
   const fetchRun = useCallback(async (runId: string) => {
     const url = `${CP_BASE}/api/runs/${runId}`;
@@ -304,15 +360,61 @@ export default function RunDetailPage({
                 : [],
               delta: delta ?? null,
             });
+            setInventorySummaryRawPayload(p as Record<string, unknown>);
             setInventorySummaryError(null);
           } else {
             setInventorySummary(null);
+            setInventorySummaryRawPayload(null);
           }
         })
         .catch(() => {
           setInventorySummary(null);
+          setInventorySummaryRawPayload(null);
           setInventorySummaryError("Could not load inventory summary");
         });
+    };
+    load();
+    if (!run || TERMINAL_STATUSES.includes(run.status)) return;
+    const interval = setInterval(load, 2000);
+    return () => clearInterval(interval);
+  }, [id, run?.status]);
+
+  useEffect(() => {
+    if (!id) return;
+    const load = () => {
+      const url = `${CP_BASE}/api/runs/${id}/artifacts?artifact_type=returns_summary&order=desc&limit=1`;
+      fetch(url)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        })
+        .then((data: { items?: { payload?: Record<string, unknown> }[] }) => {
+          const artifact = Array.isArray(data.items) && data.items.length > 0 ? data.items[0] : null;
+          if (artifact && artifact.payload && typeof artifact.payload === "object") {
+            const p = artifact.payload;
+            setReturnsSummary({
+              facility_id: String(p.facility_id ?? ""),
+              provider: String(p.provider ?? ""),
+              fixture_used: typeof p.fixture_used === "string" ? p.fixture_used : undefined,
+              as_of: typeof p.as_of === "string" ? p.as_of : null,
+              returns_count: Number(p.returns_count ?? 0),
+              total_units: Number(p.total_units ?? 0),
+              pending_count: Number(p.pending_count ?? 0),
+              received_count: Number(p.received_count ?? 0),
+              processed_count: Number(p.processed_count ?? 0),
+              needs_attention_count: Number(p.needs_attention_count ?? 0),
+              pending_return_ids_sample: Array.isArray(p.pending_return_ids_sample)
+                ? (p.pending_return_ids_sample as string[])
+                : [],
+              aging_return_ids_sample: Array.isArray(p.aging_return_ids_sample)
+                ? (p.aging_return_ids_sample as string[])
+                : [],
+            });
+          } else {
+            setReturnsSummary(null);
+          }
+        })
+        .catch(() => setReturnsSummary(null));
     };
     load();
     if (!run || TERMINAL_STATUSES.includes(run.status)) return;
@@ -347,6 +449,65 @@ export default function RunDetailPage({
         .catch(() => {
           setRawIngestRows([]);
           setRawIngestsError("Could not load raw ingests");
+        });
+    };
+    load();
+    if (!run || TERMINAL_STATUSES.includes(run.status)) return;
+    const interval = setInterval(load, 4000);
+    return () => clearInterval(interval);
+  }, [id, run?.status]);
+
+  // All artifacts (audit); poll while run is active
+  useEffect(() => {
+    if (!id) return;
+    const load = () => {
+      fetch(`${CP_BASE}/api/runs/${encodeURIComponent(id)}/artifacts?limit=30&order=desc`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        })
+        .then((data: { items?: ArtifactRow[] }) => {
+          setRunArtifacts(Array.isArray(data.items) ? data.items : []);
+          setArtifactsError(null);
+        })
+        .catch(() => {
+          setRunArtifacts([]);
+          setArtifactsError("Could not load artifacts");
+        });
+    };
+    load();
+    if (!run || TERMINAL_STATUSES.includes(run.status)) return;
+    const interval = setInterval(load, 5000);
+    return () => clearInterval(interval);
+  }, [id, run?.status]);
+
+  // Run-scoped snapshot from raw ingest (inventory_snapshot_v0)
+  useEffect(() => {
+    if (!id) return;
+    const load = () => {
+      fetch(`${CP_BASE}/api/runs/${encodeURIComponent(id)}/inventory-snapshot`)
+        .then((res) => res.json())
+        .then(
+          (data: InvSnapOk & { ok?: boolean; reason?: string; message?: string }) => {
+            if (data.ok === true && Array.isArray(data.items)) {
+              setInvSnapshot(data as InvSnapOk);
+              setInvSnapshotReason(null);
+              return;
+            }
+            setInvSnapshot(null);
+            const r = data.reason;
+            if (r === "not_inventory_snapshot_run") {
+              setInvSnapshotReason(null);
+            } else if (r === "missing_raw_ingest" || r === "missing_facility_id") {
+              setInvSnapshotReason("pending");
+            } else {
+              setInvSnapshotReason(typeof data.message === "string" ? data.message : r ?? "unavailable");
+            }
+          },
+        )
+        .catch(() => {
+          setInvSnapshot(null);
+          setInvSnapshotReason("Could not load snapshot");
         });
     };
     load();
@@ -452,9 +613,14 @@ export default function RunDetailPage({
     typeof (r.parameters as Record<string, unknown>).facility_id === "string"
       ? ((r.parameters as Record<string, unknown>).facility_id as string)
       : null;
-  const displayFacilityId = inventorySummary?.facility_id || paramFacilityId;
+  const displayFacilityId = returnsSummary?.facility_id || inventorySummary?.facility_id || paramFacilityId;
+  const isReturnsRun = Boolean(returnsSummary);
   const facilityViewHref =
-    displayFacilityId && r.tenant_id ? facilityInventoryHref(displayFacilityId, r.tenant_id) : null;
+    displayFacilityId && r.tenant_id
+      ? isReturnsRun
+        ? facilityReturnsHref(displayFacilityId, r.tenant_id)
+        : facilityInventoryHref(displayFacilityId, r.tenant_id)
+      : null;
 
   return (
     <main className="p-6 max-w-3xl mx-auto">
@@ -517,7 +683,7 @@ export default function RunDetailPage({
               href={facilityViewHref}
               className="text-blue-600 dark:text-blue-400 hover:underline"
             >
-              View facility inventory →
+              View facility {isReturnsRun ? "returns" : "inventory"} →
             </Link>
           </p>
         )}
@@ -679,11 +845,16 @@ export default function RunDetailPage({
         )}
       </section>
 
-      {/* Inventory Summary — after parameters so operators see inputs, outputs, then trace */}
-      <section className="mb-6">
-        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
-          Inventory Summary
+      <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
+        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-4">
+          Run outputs
         </h2>
+
+      {/* Inventory Summary (parsed inventory_summary artifact) */}
+      <section className="mb-6">
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Inventory Summary
+        </h3>
         {inventorySummaryError && (
           <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{inventorySummaryError}</p>
         )}
@@ -864,15 +1035,149 @@ export default function RunDetailPage({
                     )}
                 </div>
               )}
+            {inventorySummaryRawPayload && (
+              <div className="border-t border-gray-200 dark:border-gray-700 pt-2 mt-1">
+                <button
+                  type="button"
+                  onClick={() => setSummaryJsonOpen((o) => !o)}
+                  className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  {summaryJsonOpen ? "Hide" : "Show"} full inventory_summary JSON
+                </button>
+                {summaryJsonOpen && (
+                  <pre className="mt-2 p-2 text-xs overflow-x-auto max-h-64 overflow-y-auto bg-gray-100 dark:bg-gray-800 rounded border border-gray-200 dark:border-gray-700">
+                    {JSON.stringify(inventorySummaryRawPayload, null, 2)}
+                  </pre>
+                )}
+              </div>
+            )}
           </div>
         ) : null}
       </section>
 
+      <section className="mb-6">
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Returns Summary
+        </h3>
+        {!returnsSummary ? (
+          <p className="text-sm text-gray-500">No returns summary for this run yet.</p>
+        ) : (
+          <div className="rounded border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 p-3 text-sm space-y-1">
+            <div>Facility: <span className="font-mono">{returnsSummary.facility_id || "—"}</span></div>
+            <div>Provider: <span className="font-mono">{returnsSummary.provider || "—"}</span></div>
+            {returnsSummary.fixture_used ? <div>Fixture: <span className="font-mono">{returnsSummary.fixture_used}</span></div> : null}
+            <div>As of: {returnsSummary.as_of ? formatDate(returnsSummary.as_of) : "—"}</div>
+            <div>Returns count: <span className="font-mono">{returnsSummary.returns_count}</span></div>
+            <div>Total units: <span className="font-mono">{returnsSummary.total_units}</span></div>
+            <div>Pending / Received / Processed: <span className="font-mono">{returnsSummary.pending_count} / {returnsSummary.received_count} / {returnsSummary.processed_count}</span></div>
+            <div>Needs attention: <span className="font-mono">{returnsSummary.needs_attention_count}</span></div>
+            <div className="text-xs">Pending sample: {(returnsSummary.pending_return_ids_sample ?? []).join(", ") || "—"}</div>
+            <div className="text-xs">Aging sample: {(returnsSummary.aging_return_ids_sample ?? []).join(", ") || "—"}</div>
+          </div>
+        )}
+      </section>
+
+      {(invSnapshot !== null || invSnapshotReason !== null) && (
+        <section className="mb-6">
+          <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+            Snapshot items (raw ingest)
+          </h3>
+          {invSnapshot && (
+            <>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+                {invSnapshot.count} row(s) · as_of {invSnapshot.as_of ? formatDate(invSnapshot.as_of) : "—"} ·
+                provider {invSnapshot.provider ?? "—"} / {invSnapshot.mapping_version ?? "—"}
+              </p>
+              {facilityViewHref && (
+                <p className="text-xs mb-2">
+                  <Link href={facilityViewHref} className="text-blue-600 dark:text-blue-400 hover:underline">
+                    Facility inventory &amp; history
+                  </Link>
+                  <span className="text-gray-500"> — compare two runs from history (not live canonical).</span>
+                </p>
+              )}
+              <div className="overflow-x-auto rounded border border-gray-200 dark:border-gray-700 max-h-56 overflow-y-auto">
+                <table className="min-w-full text-xs">
+                  <thead className="bg-gray-100 dark:bg-gray-800 sticky top-0">
+                    <tr>
+                      <th className="p-1.5 text-left font-medium">SKU</th>
+                      <th className="p-1.5 text-left font-medium">On hand</th>
+                      <th className="p-1.5 text-left font-medium">Avail</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {invSnapshot.items.slice(0, 20).map((row) => (
+                      <tr key={row.sku} className="border-t border-gray-200 dark:border-gray-700">
+                        <td className="p-1.5 font-mono">{row.sku}</td>
+                        <td className="p-1.5 font-mono">{row.on_hand}</td>
+                        <td className="p-1.5 font-mono">{row.available ?? "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {invSnapshot.count > 20 && (
+                <p className="text-xs text-gray-500 mt-1">Showing 20 of {invSnapshot.count} rows.</p>
+              )}
+            </>
+          )}
+          {!invSnapshot && invSnapshotReason === "pending" && (
+            <p className="text-sm text-gray-500">
+              No raw-ingest snapshot yet (queued, running, or failed before ingest).
+            </p>
+          )}
+          {!invSnapshot && invSnapshotReason && invSnapshotReason !== "pending" && (
+            <p className="text-amber-700 dark:text-amber-300 text-sm">{invSnapshotReason}</p>
+          )}
+        </section>
+      )}
+
+      <section className="mb-6">
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Artifacts
+        </h3>
+        {artifactsError && (
+          <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{artifactsError}</p>
+        )}
+        {runArtifacts.length === 0 && !artifactsError ? (
+          <p className="text-sm text-gray-500">No artifacts for this run.</p>
+        ) : (
+          <ul className="space-y-2 text-sm">
+            {runArtifacts.map((a) => (
+              <li
+                key={a.id}
+                className="rounded border border-gray-200 dark:border-gray-700 overflow-hidden"
+              >
+                <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-900/40">
+                  <span className="font-mono text-xs font-medium">{a.artifact_type}</span>
+                  <span className="text-xs text-gray-500">{formatDate(a.created_at)}</span>
+                  {a.source ? <span className="text-xs text-gray-400">[{a.source}]</span> : null}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setArtifactPayloadOpenId((x) => (x === a.id ? null : a.id))
+                    }
+                    className="text-xs text-blue-600 dark:text-blue-400 hover:underline ml-auto"
+                  >
+                    {artifactPayloadOpenId === a.id ? "Hide payload" : "View payload"}
+                  </button>
+                </div>
+                {artifactPayloadOpenId === a.id && (
+                  <pre className="p-3 text-xs overflow-x-auto max-h-64 overflow-y-auto bg-gray-100 dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700">
+                    {JSON.stringify(a.payload ?? {}, null, 2)}
+                  </pre>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       {/* Raw ingests */}
       <section className="mb-6">
-        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+        <h3 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
           Raw ingests
-        </h2>
+        </h3>
         {rawIngestsError && (
           <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{rawIngestsError}</p>
         )}
@@ -914,6 +1219,7 @@ export default function RunDetailPage({
           </div>
         )}
       </section>
+      </div>
 
       {/* Logs */}
       <section className="mb-6">

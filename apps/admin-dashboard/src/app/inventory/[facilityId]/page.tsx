@@ -2,7 +2,7 @@
 
 import { Suspense, useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 const CP_BASE =
   (typeof process !== "undefined" && process.env.NEXT_PUBLIC_CP_BASE) ||
@@ -91,11 +91,28 @@ type FacilityRawIngestRow = {
   payload: Record<string, unknown>;
 };
 
+type SnapshotPipelineVersion = {
+  id: string;
+  pipeline_id: string;
+  version: string;
+  created_at: string | null;
+  pipeline_name: string | null;
+};
+
+function compareRunsHref(tenantId: string, runIdOlder: string, runIdNewer: string): string {
+  const p = new URLSearchParams();
+  p.set("tenant_id", tenantId);
+  p.set("run_id_a", runIdOlder);
+  p.set("run_id_b", runIdNewer);
+  return `/inventory/compare?${p.toString()}`;
+}
+
 function FacilityInventoryInner({
   params,
 }: {
   params: Promise<{ facilityId: string }>;
 }) {
+  const router = useRouter();
   const searchParams = useSearchParams();
   const tenantId = searchParams.get("tenant_id")?.trim() || "";
 
@@ -114,6 +131,13 @@ function FacilityInventoryInner({
   const [rawIngests, setRawIngests] = useState<FacilityRawIngestRow[]>([]);
   const [rawIngestsError, setRawIngestsError] = useState<string | null>(null);
   const [rawFacilityOpenId, setRawFacilityOpenId] = useState<string | null>(null);
+  const [comparePick, setComparePick] = useState<string[]>([]);
+  const [snapshotVersions, setSnapshotVersions] = useState<SnapshotPipelineVersion[]>([]);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
+  const [selectedPvId, setSelectedPvId] = useState("");
+  const [fixtureOverride, setFixtureOverride] = useState("");
+  const [triggerSubmitting, setTriggerSubmitting] = useState(false);
+  const [triggerError, setTriggerError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -188,6 +212,28 @@ function FacilityInventoryInner({
     if (!facilityId || !tenantId) return;
     loadSummaryAndHistory(facilityId, tenantId);
   }, [facilityId, tenantId, loadSummaryAndHistory]);
+
+  useEffect(() => {
+    if (!tenantId) return;
+    setVersionsError(null);
+    fetch(`${CP_BASE}/api/inventory/approved-snapshot-versions?tenant_id=${encodeURIComponent(tenantId)}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data: { items?: SnapshotPipelineVersion[] }) => {
+        const items = Array.isArray(data.items) ? data.items : [];
+        setSnapshotVersions(items);
+        setSelectedPvId((cur) => {
+          if (cur && items.some((v) => v.id === cur)) return cur;
+          return items[0]?.id ?? "";
+        });
+      })
+      .catch(() => {
+        setSnapshotVersions([]);
+        setVersionsError("Could not load approved inventory pipeline versions.");
+      });
+  }, [tenantId]);
 
   useEffect(() => {
     if (!facilityId || !tenantId) return;
@@ -268,6 +314,102 @@ function FacilityInventoryInner({
       <p className="text-sm text-gray-500 dark:text-gray-400 font-mono break-all mb-6">
         {facilityId}
       </p>
+
+      {/* Trigger new snapshot */}
+      <section className="mb-8 rounded border border-gray-200 dark:border-gray-700 p-4">
+        <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
+          Run inventory snapshot
+        </h2>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+          Creates a <code className="font-mono">QUEUED</code> run for an{" "}
+          <strong>APPROVED</strong> <code className="font-mono">inventory_snapshot_v0</code> version.
+          When several exist, the default is the <strong>newest by created_at</strong> (change below).
+        </p>
+        {versionsError && (
+          <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{versionsError}</p>
+        )}
+        {snapshotVersions.length === 0 && !versionsError ? (
+          <p className="text-sm text-gray-500">No approved inventory snapshot versions for this tenant.</p>
+        ) : (
+          <div className="space-y-3 text-sm max-w-xl">
+            {snapshotVersions.length > 1 && (
+              <label className="block">
+                <span className="text-gray-600 dark:text-gray-300 text-xs block mb-1">Pipeline version</span>
+                <select
+                  value={selectedPvId}
+                  onChange={(e) => setSelectedPvId(e.target.value)}
+                  className="w-full px-2 py-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono text-xs"
+                >
+                  {snapshotVersions.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.pipeline_name ?? v.pipeline_id} / {v.version} ({shortId(v.id)})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            <label className="block">
+              <span className="text-gray-600 dark:text-gray-300 text-xs block mb-1">
+                Fixture override (optional, mock only)
+              </span>
+              <input
+                type="text"
+                value={fixtureOverride}
+                onChange={(e) => setFixtureOverride(e.target.value)}
+                placeholder="e.g. inventory_mock_v2.json — leave blank for pipeline default"
+                className="w-full px-2 py-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 font-mono text-xs"
+              />
+            </label>
+            {triggerError && (
+              <p className="text-red-600 dark:text-red-400 text-sm" role="alert">
+                {triggerError}
+              </p>
+            )}
+            <button
+              type="button"
+              disabled={triggerSubmitting || !selectedPvId || !facilityId}
+              onClick={async () => {
+                setTriggerError(null);
+                setTriggerSubmitting(true);
+                try {
+                  const parameters: Record<string, string> = { facility_id: facilityId };
+                  const fx = fixtureOverride.trim();
+                  if (fx) parameters.fixture = fx;
+                  const res = await fetch(`${CP_BASE}/api/runs`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      tenant_id: tenantId,
+                      pipeline_version_id: selectedPvId,
+                      trigger_type: "manual",
+                      parameters,
+                    }),
+                  });
+                  const j = await res.json().catch(() => ({}));
+                  if (!res.ok) {
+                    const msg =
+                      typeof j.detail === "string"
+                        ? j.detail
+                        : Array.isArray(j.detail)
+                          ? JSON.stringify(j.detail)
+                          : "Failed to create run";
+                    throw new Error(msg);
+                  }
+                  const newId = (j as { id?: string }).id;
+                  if (newId) router.push(`/runs/${newId}`);
+                } catch (e) {
+                  setTriggerError(e instanceof Error ? e.message : "Failed to create run");
+                } finally {
+                  setTriggerSubmitting(false);
+                }
+              }}
+              className="px-4 py-2 rounded bg-blue-200 text-blue-900 dark:bg-blue-900 dark:text-blue-100 text-sm font-medium hover:opacity-90 disabled:opacity-40"
+            >
+              {triggerSubmitting ? "Creating…" : "Queue snapshot run"}
+            </button>
+          </div>
+        )}
+      </section>
 
       {/* A — Current summary (canonical, API aggregate) */}
       <section className="mb-8">
@@ -469,8 +611,45 @@ function FacilityInventoryInner({
         <h2 className="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-2">
           Recent inventory snapshot runs
         </h2>
+        <p className="text-xs text-gray-500 dark:text-gray-400 mb-2">
+          Select up to two runs to compare (older run = A, newer = B).{" "}
+          <strong>vs prev</strong> compares this row to the next older snapshot in the list.
+        </p>
         {historyError && (
           <p className="text-amber-600 dark:text-amber-400 text-sm mb-2">{historyError}</p>
+        )}
+        {comparePick.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2 mb-2 text-sm">
+            <span className="text-gray-600 dark:text-gray-300">
+              Selected: {comparePick.map((id) => shortId(id)).join(", ")}
+            </span>
+            {comparePick.length === 2 && (
+              <Link
+                href={compareRunsHref(
+                  tenantId,
+                  ...(() => {
+                    const rows = history.filter((x) => comparePick.includes(x.run_id));
+                    if (rows.length < 2)
+                      return [comparePick[0], comparePick[1]] as [string, string];
+                    rows.sort((a, b) =>
+                      (a.created_at || "").localeCompare(b.created_at || ""),
+                    );
+                    return [rows[0].run_id, rows[1].run_id] as [string, string];
+                  })(),
+                )}
+                className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
+              >
+                Compare selected →
+              </Link>
+            )}
+            <button
+              type="button"
+              onClick={() => setComparePick([])}
+              className="text-xs text-gray-500 hover:underline"
+            >
+              Clear selection
+            </button>
+          </div>
         )}
         {history.length === 0 && !historyError ? (
           <p className="text-sm text-gray-500">No inventory snapshot runs recorded for this facility.</p>
@@ -479,7 +658,11 @@ function FacilityInventoryInner({
             <table className="min-w-full text-sm">
               <thead className="bg-gray-100 dark:bg-gray-800 text-left">
                 <tr>
+                  <th className="p-2 w-8 font-medium" title="Select for compare">
+                    Cmp
+                  </th>
                   <th className="p-2 font-medium">Created</th>
+                  <th className="p-2 font-medium">Finished</th>
                   <th className="p-2 font-medium">Status</th>
                   <th className="p-2 font-medium">Fixture</th>
                   <th className="p-2 font-medium">Items</th>
@@ -487,36 +670,71 @@ function FacilityInventoryInner({
                   <th className="p-2 font-medium">Δ chg</th>
                   <th className="p-2 font-medium">New</th>
                   <th className="p-2 font-medium">OOS↔</th>
+                  <th className="p-2 font-medium">Compare</th>
                   <th className="p-2 font-medium">Run</th>
                 </tr>
               </thead>
               <tbody>
-                {history.map((h) => (
-                  <tr key={h.run_id} className="border-t border-gray-200 dark:border-gray-700">
-                    <td className="p-2 whitespace-nowrap">{formatDate(h.created_at)}</td>
-                    <td className="p-2">
-                      <span className={statusBadgeClass(h.status)}>{h.status}</span>
-                    </td>
-                    <td className="p-2 font-mono text-xs max-w-[8rem] truncate" title={h.fixture_used ?? ""}>
-                      {h.fixture_used ?? "—"}
-                    </td>
-                    <td className="p-2 font-mono">{h.items_total ?? "—"}</td>
-                    <td className="p-2 font-mono">{h.out_of_stock ?? "—"}</td>
-                    <td className="p-2 font-mono">{h.changed_skus_count ?? "—"}</td>
-                    <td className="p-2 font-mono">{h.new_skus_count ?? "—"}</td>
-                    <td className="p-2 text-xs">
-                      ΔOOS {h.new_out_of_stock_count ?? "—"} / BI {h.back_in_stock_count ?? "—"}
-                    </td>
-                    <td className="p-2">
-                      <Link
-                        href={`/runs/${h.run_id}`}
-                        className="text-blue-600 dark:text-blue-400 hover:underline font-mono text-xs"
+                {history.map((h, idx) => {
+                  const prevRow = history[idx + 1];
+                  return (
+                    <tr key={h.run_id} className="border-t border-gray-200 dark:border-gray-700">
+                      <td className="p-2 align-top">
+                        <input
+                          type="checkbox"
+                          checked={comparePick.includes(h.run_id)}
+                          onChange={() => {
+                            setComparePick((prev) => {
+                              if (prev.includes(h.run_id))
+                                return prev.filter((x) => x !== h.run_id);
+                              if (prev.length < 2) return [...prev, h.run_id];
+                              return [prev[1], h.run_id];
+                            });
+                          }}
+                          aria-label={`Select run ${shortId(h.run_id)} for compare`}
+                        />
+                      </td>
+                      <td className="p-2 whitespace-nowrap align-top">{formatDate(h.created_at)}</td>
+                      <td className="p-2 whitespace-nowrap align-top">{formatDate(h.finished_at)}</td>
+                      <td className="p-2 align-top">
+                        <span className={statusBadgeClass(h.status)}>{h.status}</span>
+                      </td>
+                      <td
+                        className="p-2 font-mono text-xs max-w-[7rem] truncate align-top"
+                        title={h.fixture_used ?? ""}
                       >
-                        {shortId(h.run_id)}
-                      </Link>
-                    </td>
-                  </tr>
-                ))}
+                        {h.fixture_used ?? "—"}
+                      </td>
+                      <td className="p-2 font-mono align-top">{h.items_total ?? "—"}</td>
+                      <td className="p-2 font-mono align-top">{h.out_of_stock ?? "—"}</td>
+                      <td className="p-2 font-mono align-top">{h.changed_skus_count ?? "—"}</td>
+                      <td className="p-2 font-mono align-top">{h.new_skus_count ?? "—"}</td>
+                      <td className="p-2 text-xs align-top">
+                        ΔOOS {h.new_out_of_stock_count ?? "—"} / BI {h.back_in_stock_count ?? "—"}
+                      </td>
+                      <td className="p-2 align-top whitespace-nowrap">
+                        {prevRow ? (
+                          <Link
+                            href={compareRunsHref(tenantId, prevRow.run_id, h.run_id)}
+                            className="text-blue-600 dark:text-blue-400 hover:underline text-xs"
+                          >
+                            vs prev
+                          </Link>
+                        ) : (
+                          <span className="text-gray-400 text-xs">—</span>
+                        )}
+                      </td>
+                      <td className="p-2 align-top">
+                        <Link
+                          href={`/runs/${h.run_id}`}
+                          className="text-blue-600 dark:text-blue-400 hover:underline font-mono text-xs"
+                        >
+                          {shortId(h.run_id)}
+                        </Link>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

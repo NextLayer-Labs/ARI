@@ -554,18 +554,27 @@ The dashboard will be available at `http://localhost:3000`
   - items_total, out_of_stock, sample OOS SKUs
   - When the artifact includes `delta` (newer worker): change counts (changed / unchanged / new / removed), on-hand quantity changes, optional total on-hand prev→curr, samples for newly OOS and back-in-stock SKUs, and top on-hand deltas
 - **Logs** show optional `meta` JSON under each line when present (step metadata from the data-plane worker).
-- Section order on the page: … → Parameters → **Inventory Summary** → **Raw ingests** (rows for this run; expand JSON) → Logs (outputs sit next to the execution trace).
+- **Run outputs** (grouped block after Parameters): **Inventory Summary** (parsed `inventory_summary`; optional **Show full … JSON**), **Snapshot items** (first rows from `GET /api/runs/{id}/inventory-snapshot` / raw-ingest fixture), **Artifacts** (all artifact types with collapsible payloads; polls while non-terminal), **Raw ingests** (per-row payload toggle). Then **Logs**.
 - **Facility inventory**: When `parameters.facility_id` or the inventory summary artifact includes a facility ID, **Identity** shows a link to **`/inventory/[facilityId]?tenant_id=...`**. The facility ID in the **Inventory Summary** card is also clickable when the tenant is known.
 
 #### `/inventory` - Facility inventory (home)
 
 - Enter a **tenant ID** to load facilities via `GET /api/facilities` and open **`/inventory/[facilityId]?tenant_id=...`** for each row.
 - Optionally paste a facility UUID with tenant ID to jump directly.
+- **Compare two runs:** open **`/inventory/compare?tenant_id=...&run_id_a=...&run_id_b=...`** (run A = older baseline, run B = newer); usually reached from facility history (**vs prev** or **Compare selected**).
+
+#### `/inventory/compare` - Compare two snapshot runs
+
+- **Query:** `tenant_id`, `run_id_a`, `run_id_b` (all required). Run A is the **older** baseline; run B is the **newer** snapshot.
+- Loads **`GET /api/inventory/compare-runs`**. Diff is from each run’s **raw ingest fixture `items`**, not from current canonical inventory.
+- Shows facility/tenant context, both run summaries, aggregate counts, OOS transition samples, and a per-SKU table (largest |Δ on-hand| first; may be truncated with a note).
+- Links back to both run detail pages and the facility inventory page.
 
 #### `/inventory/[facilityId]` - Facility inventory (detail)
 
 - **Query:** `tenant_id` (required) — must match the facility’s tenant.
-- **Page layout (top to bottom):** current canonical **summary** → canonical **inventory table** (not artifacts) → **Latest snapshot insight** (from newest facility-history row / `inventory_summary` when present) → **Recent inventory snapshot runs** (same API; links to run detail) → **Raw ingests (recent)** for the facility (`GET /api/inventory/raw-ingests`).
+- **Run inventory snapshot:** form at the top loads **`GET /api/inventory/approved-snapshot-versions`** (newest APPROVED `inventory_snapshot_v0` per tenant is pre-selected when multiple exist). Queues **`POST /api/runs`** with `parameters.facility_id` and optional `parameters.fixture` override, then redirects to the new run detail page.
+- **Page layout (top to bottom):** **Run snapshot** form → current canonical **summary** → canonical **inventory table** (not artifacts) → **Latest snapshot insight** (from newest facility-history row / `inventory_summary` when present) → **Recent inventory snapshot runs** (created/finished columns, **vs prev**, checkboxes + **Compare selected**, open run) → **Raw ingests (recent)** (`GET /api/inventory/raw-ingests`).
 - **Current state (canonical):** `GET /api/inventory/facility-summary` — SKU count, total on-hand, OOS count (same rule as the worker), latest `as_of`.
 - **Inventory table:** `GET /api/inventory/items` with pagination; optional **Out of stock only** (`oos_only=true`).
 - **Latest snapshot insight:** Derived from the most recent row in facility history (artifact fields when present).
@@ -978,7 +987,8 @@ Write-Host "Run 2: $run2Id — open http://localhost:3000/runs/$run2Id for delta
 
 1. Open `http://localhost:3000/runs/<run2_id>` (the second run’s UUID from the script, e.g. `$run2Id`) — use **View facility inventory →** (Identity) or click **Facility** in Inventory Summary — confirm `/inventory/<facility_id>?tenant_id=...`.
 2. Or open `http://localhost:3000/inventory`, paste `$tenantId`, pick the facility → **View inventory**.
-3. On the facility page confirm: canonical summary + table, latest snapshot card, history table (two runs), raw ingests list with payloads.
+3. On the facility page confirm: **Run inventory snapshot** form, canonical summary + table, latest snapshot card, history table (two runs; use **vs prev** or select two runs → **Compare selected**), raw ingests list with payloads.
+4. Open compare in the browser: `http://localhost:3000/inventory/compare?tenant_id=$tenantId&run_id_a=$run1Id&run_id_b=$run2Id` (replace with your UUIDs), or use **vs prev** from history.
 
 **API checks (PowerShell, optional):**
 
@@ -987,6 +997,9 @@ Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/facility-summary?fac
 Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/facility-history?facility_id=$facilityId&tenant_id=$tenantId&limit=10"
 Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/raw-ingests?facility_id=$facilityId&tenant_id=$tenantId&limit=5"
 Invoke-RestMethod -Uri "http://localhost:8000/api/runs/$run2Id/raw-ingests?limit=10"
+Invoke-RestMethod -Uri "http://localhost:8000/api/runs/$run1Id/inventory-snapshot"
+Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/compare-runs?tenant_id=$tenantId&run_id_a=$run1Id&run_id_b=$run2Id"
+Invoke-RestMethod -Uri "http://localhost:8000/api/inventory/approved-snapshot-versions?tenant_id=$tenantId"
 ```
 
 ### Step 2: Create a Run
@@ -1647,6 +1660,26 @@ Recent raw ingest rows for a **facility** (all runs), newest `fetched_at` first.
 
 **Errors:** `404` if facility not found for that tenant.
 
+#### GET /api/inventory/compare-runs
+
+Compares two **`inventory_snapshot_v0`** runs for the same **tenant** and **facility**. Per-SKU diff is computed from each run’s **latest raw ingest** fixture (`payload.items` as written by the worker), not from live `canonical_inventory_items`.
+
+**Query:** `tenant_id`, `run_id_a`, `run_id_b` (all required). Convention: **A** = older baseline, **B** = newer snapshot (`new_in_b`, `removed_from_b`, `delta_on_hand` are interpreted accordingly).
+
+**Response:** `200 OK` — `tenant_id`, `facility_id`, `run_id_a`, `run_id_b`, `summary_a`, `summary_b` (compact run + artifact hints), aggregate counts (`changed_skus_count`, `unchanged_skus_count`, `new_skus_count`, `removed_skus_count`, `new_out_of_stock_count`, `back_in_stock_count`, `total_on_hand_a` / `total_on_hand_b` / `total_on_hand_delta`), `sku_changes` (sorted by largest absolute on-hand delta; capped, see `sku_changes_truncated` / `sku_changes_total`), sample SKU lists for OOS transitions, `source: "raw_ingest_fixture_items"`.
+
+**Errors:** `404` run not found; `400` tenant mismatch, wrong pipeline kind, facility mismatch between runs, or same run id twice; `422` missing/invalid raw ingest or facility resolution — body `detail: { "reason", "message" }`.
+
+#### GET /api/inventory/approved-snapshot-versions
+
+Lists **APPROVED** pipeline versions for a tenant where `dag_spec.kind === "inventory_snapshot_v0"`, **newest `created_at` first** (limit 50). Used by the facility page to queue snapshot runs.
+
+**Query:** `tenant_id` (required)
+
+**Response:** `{ "items": [ { "id", "pipeline_id", "version", "created_at", "pipeline_name" } ], "count" }`
+
+**Errors:** `404` if tenant not found.
+
 #### GET /api/facilities
 
 **Query:** `tenant_id` (required), `limit`, `offset`
@@ -1660,6 +1693,14 @@ Lists raw ingest rows for a run (newest first). Same path prefix as POST; used f
 **Query:** `limit` (default 50, max 100)
 
 **Response:** `{ "found": true, "run_id", "items": [ { "id", "run_id", "tenant_id", "facility_id", "provider", "mapping_version", "fetched_at", "as_of", "payload" } ], "limit" }`
+
+#### GET /api/runs/{id}/inventory-snapshot
+
+Returns the **normalized item rows** for this run from its **latest raw ingest** fixture (`items` array), for **`inventory_snapshot_v0`** only. This is the same logical snapshot used for **`/api/inventory/compare-runs`**, not the current canonical table.
+
+**Response:** `200 OK` — `{ "ok": true, "run_id", "tenant_id", "facility_id", "status", "created_at", "finished_at", "provider", "mapping_version", "as_of", "raw_ingest_id", "items": [ { "sku", "on_hand", "available", "reserved" } ], "count", "summary_artifact_present" }`
+
+**Errors:** JSON body `{ "ok": false, "reason", "message" }` with `404` (run not found), `400` (not `inventory_snapshot_v0`), or `422` (missing raw ingest, bad payload, missing `facility_id`).
 
 ---
 
@@ -1843,6 +1884,72 @@ Lists raw ingest rows for a run (newest first). Same path prefix as POST; used f
 4. Verify migration `a1b2c3d4e5f6_pipeline_runs_timestamptz.py` was applied
 
 ---
+
+## Returns snapshot v0 (Layer-1)
+
+This repo now includes a second Layer-1 BOH workflow slice: `returns_snapshot_v0`.
+
+- Pattern matches inventory: raw ingest append-only -> canonical current-state rows -> computed summary artifact.
+- Worker supports `dag_spec.kind = "returns_snapshot_v0"` with mock-only provider and safe fixture override (`parameters.fixture`).
+- New fixtures:
+  - `apps/data-plane-worker/fixtures/returns_mock_v1.json`
+  - `apps/data-plane-worker/fixtures/returns_mock_v2.json`
+- New canonical table: `canonical_return_items` (tenant/facility scoped; keyed by `return_id`).
+- New artifact type: `returns_summary`.
+- Dashboard pages:
+  - `/returns`
+  - `/returns/[facilityId]?tenant_id=<tenant_uuid>`
+
+### Example `dag_spec` for returns snapshot
+
+```json
+{
+  "kind": "returns_snapshot_v0",
+  "provider": {
+    "type": "mock",
+    "fixture": "returns_mock_v1.json"
+  },
+  "mapping_version": "returns_mock_v1"
+}
+```
+
+### Returns endpoints
+
+- `POST /api/returns/items:upsert`
+- `GET /api/returns/items?tenant_id=...&facility_id=...&limit=...&offset=...`
+- `GET /api/returns/facility-summary?tenant_id=...&facility_id=...`
+- `GET /api/returns/facility-history?tenant_id=...&facility_id=...&limit=...`
+- `GET /api/returns/approved-snapshot-versions?tenant_id=...`
+
+### Returns summary artifact (current-state)
+
+`returns_summary` payload fields:
+
+- `schema_version`, `tenant_id`, `facility_id`, `provider`, `fixture_used`, `as_of`, `mapping_version`
+- `returns_count`, `total_units`
+- `pending_count`, `received_count`, `processed_count`
+- `needs_attention_count`
+- `pending_return_ids_sample`, `aging_return_ids_sample`
+- `status_breakdown`, `disposition_breakdown`
+
+Needs-attention rule:
+
+- pending return older than 7 days, or
+- received return with missing disposition.
+
+### Local Windows / PowerShell test flow (returns)
+
+1. Start stack and worker (`python worker.py` in `apps/data-plane-worker`).
+2. Create + approve pipeline version with `dag_spec.kind = "returns_snapshot_v0"`.
+3. Queue run 1 with parameters:
+   - `{ "facility_id": "<facility_uuid>", "fixture": "returns_mock_v1.json" }`
+4. Queue run 2 with parameters:
+   - `{ "facility_id": "<facility_uuid>", "fixture": "returns_mock_v2.json" }`
+5. Validate:
+   - run detail page shows **Returns Summary**
+   - `/returns/<facility_uuid>?tenant_id=<tenant_uuid>` shows summary/table/history and run trigger
+6. Confirm canonical queue:
+   - `GET /api/returns/items?tenant_id=<tenant_uuid>&facility_id=<facility_uuid>&limit=200&offset=0`
 
 ## Contributing
 

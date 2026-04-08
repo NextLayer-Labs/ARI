@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -18,9 +19,11 @@ COMPLETE_RETRY_DELAYS = [0.5, 1.0, 2.0, 4.0, 8.0]
 
 LOG_SOURCE = "data-plane-worker"
 DEFAULT_FIXTURE = "inventory_mock_v1.json"
+DEFAULT_RETURNS_FIXTURE = "returns_mock_v1.json"
 INVENTORY_PAGE_LIMIT = 500
 TOP_DELTA_LIMIT = 15
 SKU_SAMPLE_LIMIT = 8
+RETURNS_ATTENTION_PENDING_DAYS = 7
 
 
 def append_log(
@@ -174,6 +177,187 @@ def _invalid_empty_fixture() -> str:
 def _load_inventory_fixture(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _validate_returns_dag_spec(dag_spec: dict) -> None:
+    prov = dag_spec.get("provider")
+    if prov is not None and not isinstance(prov, dict):
+        raise ValueError("returns_snapshot_v0 requires dag_spec.provider to be an object when set")
+    provider_cfg = prov or {}
+    provider_type = provider_cfg.get("type") or "mock"
+    if provider_type != "mock":
+        raise ValueError(f"returns_snapshot_v0 only supports provider.type='mock'; got {provider_type!r}")
+    fx = provider_cfg.get("fixture")
+    if fx is not None and not isinstance(fx, str):
+        raise ValueError("dag_spec.provider.fixture must be a string when set")
+
+
+def _returns_fixture_name_for_run(dag_spec: dict, parameters: dict) -> str:
+    if "fixture" in parameters:
+        ov = parameters["fixture"]
+        if ov is None:
+            raise ValueError("parameters.fixture cannot be null; omit the key to use the pipeline default")
+        if not isinstance(ov, str):
+            raise ValueError(
+                "parameters.fixture must be a string (e.g. returns_mock_v2.json); "
+                f"got {type(ov).__name__}"
+            )
+        return ov.strip() or _invalid_empty_fixture()
+    provider_cfg = dag_spec.get("provider") or {}
+    return provider_cfg.get("fixture") or DEFAULT_RETURNS_FIXTURE
+
+
+def _parse_iso8601_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    return value
+
+
+def _needs_attention_return(status: str, created_at_iso: str | None, received_at_iso: str | None, disposition: str | None) -> bool:
+    status_l = (status or "").strip().lower()
+    if status_l == "received" and not disposition:
+        return True
+    if status_l != "pending" or not created_at_iso:
+        return False
+    try:
+        created_dt = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
+    except Exception:
+        return False
+    if created_dt.tzinfo is None:
+        created_dt = created_dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return (now - created_dt.astimezone(timezone.utc)).days >= RETURNS_ATTENTION_PENDING_DAYS
+
+
+def _execute_returns_snapshot_v0(
+    client: httpx.Client,
+    run_id: str,
+    dag_spec: dict,
+    parameters: dict,
+    tenant_id: str,
+) -> None:
+    _validate_returns_dag_spec(dag_spec)
+    facility_id = parameters.get("facility_id")
+    if not facility_id or not isinstance(facility_id, str):
+        raise ValueError("returns_snapshot_v0 requires parameters.facility_id (non-empty string UUID)")
+
+    provider_cfg = dag_spec.get("provider") or {}
+    provider_type = provider_cfg.get("type") or "mock"
+    mapping_version = dag_spec.get("mapping_version") or "returns_mock_v1"
+    fixture_name = _returns_fixture_name_for_run(dag_spec, parameters)
+    fixture_path = _resolve_safe_fixture_path(_fixtures_dir(), fixture_name)
+
+    append_log(client, run_id, "Validating fixture selection for returns snapshot", source=LOG_SOURCE, meta={"resolved": fixture_name})
+    append_log(client, run_id, "Loading returns fixture", source=LOG_SOURCE, meta={"fixture": fixture_name})
+    fixture = _load_inventory_fixture(fixture_path)
+    as_of = fixture.get("as_of")
+
+    append_log(client, run_id, "Writing raw ingest", source=LOG_SOURCE, meta={"facility_id": facility_id})
+    r_raw = client.post(
+        f"{CP_BASE}/api/runs/{run_id}/raw-ingests",
+        json={
+            "facility_id": facility_id,
+            "provider": provider_type,
+            "mapping_version": mapping_version,
+            "as_of": as_of,
+            "payload": fixture,
+        },
+        timeout=10,
+    )
+    r_raw.raise_for_status()
+
+    append_log(client, run_id, "Mapping raw -> canonical returns", source=LOG_SOURCE)
+    returns_in = fixture.get("returns") or []
+    canonical_items = []
+    for item in returns_in:
+        if not isinstance(item, dict):
+            continue
+        return_id = item.get("return_id")
+        sku = item.get("sku")
+        status = item.get("status")
+        if not isinstance(return_id, str) or not return_id.strip():
+            continue
+        if not isinstance(sku, str) or not sku.strip():
+            continue
+        if not isinstance(status, str) or not status.strip():
+            continue
+        canonical_items.append(
+            {
+                "return_id": return_id,
+                "order_id": item.get("order_id") if isinstance(item.get("order_id"), str) else None,
+                "sku": sku,
+                "quantity": int(item.get("quantity") or 0),
+                "status": status,
+                "reason_code": item.get("reason_code") if isinstance(item.get("reason_code"), str) else None,
+                "created_at_source": _parse_iso8601_or_none(item.get("created_at")),
+                "updated_at_source": _parse_iso8601_or_none(item.get("updated_at")),
+                "received_at": _parse_iso8601_or_none(item.get("received_at")),
+                "processed_at": _parse_iso8601_or_none(item.get("processed_at")),
+                "disposition": item.get("disposition") if isinstance(item.get("disposition"), str) else None,
+            }
+        )
+
+    append_log(client, run_id, "Upserting canonical returns", source=LOG_SOURCE, meta={"items_count": len(canonical_items)})
+    upsert = client.post(
+        f"{CP_BASE}/api/returns/items:upsert",
+        json={
+            "facility_id": facility_id,
+            "source_provider": provider_type,
+            "source_run_id": run_id,
+            "items": canonical_items,
+        },
+        timeout=20,
+    )
+    upsert.raise_for_status()
+
+    append_log(client, run_id, "Computing returns summary", source=LOG_SOURCE)
+    returns_count = len(canonical_items)
+    total_units = sum(int(x["quantity"]) for x in canonical_items)
+    pending_count = sum(1 for x in canonical_items if x["status"].strip().lower() == "pending")
+    received_count = sum(1 for x in canonical_items if x["status"].strip().lower() == "received")
+    processed_count = sum(1 for x in canonical_items if x["status"].strip().lower() == "processed")
+    needs_attention_ids = [
+        x["return_id"]
+        for x in canonical_items
+        if _needs_attention_return(x["status"], x["created_at_source"], x["received_at"], x["disposition"])
+    ]
+    status_breakdown: dict[str, int] = {}
+    disposition_breakdown: dict[str, int] = {}
+    for x in canonical_items:
+        st = x["status"].strip().lower()
+        status_breakdown[st] = status_breakdown.get(st, 0) + 1
+        disp = (x["disposition"] or "none").strip().lower()
+        disposition_breakdown[disp] = disposition_breakdown.get(disp, 0) + 1
+
+    summary_payload = {
+        "schema_version": 1,
+        "tenant_id": tenant_id,
+        "facility_id": facility_id,
+        "provider": provider_type,
+        "fixture_used": fixture_name,
+        "as_of": as_of,
+        "returns_count": returns_count,
+        "total_units": total_units,
+        "pending_count": pending_count,
+        "received_count": received_count,
+        "processed_count": processed_count,
+        "needs_attention_count": len(needs_attention_ids),
+        "pending_return_ids_sample": [x["return_id"] for x in canonical_items if x["status"].strip().lower() == "pending"][:10],
+        "aging_return_ids_sample": needs_attention_ids[:10],
+        "status_breakdown": status_breakdown,
+        "disposition_breakdown": disposition_breakdown,
+        "mapping_version": mapping_version,
+    }
+    append_log(client, run_id, "Writing summary artifact", source=LOG_SOURCE, meta={"artifact_type": "returns_summary"})
+    r_art = client.post(
+        f"{CP_BASE}/api/runs/{run_id}/artifacts",
+        json={"artifact_type": "returns_summary", "payload": summary_payload, "source": LOG_SOURCE},
+        timeout=10,
+    )
+    r_art.raise_for_status()
+    append_log(client, run_id, "returns_snapshot_v0 workflow completed", source=LOG_SOURCE, meta={"returns_count": returns_count})
 
 
 def _fetch_canonical_inventory_for_facility(
@@ -618,6 +802,23 @@ def main():
                     if not isinstance(params, dict):
                         params = {}
                     _execute_inventory_snapshot_v0(client, run_id, dag_spec, params, tenant_id)
+                elif isinstance(dag_spec, dict) and dag_spec.get("kind") == "returns_snapshot_v0":
+                    append_log(
+                        client,
+                        run_id,
+                        "Executing returns_snapshot_v0 pipeline",
+                        source=LOG_SOURCE,
+                        meta={"kind": "returns_snapshot_v0"},
+                    )
+                    params = run.get("parameters") or {}
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except json.JSONDecodeError:
+                            params = {}
+                    if not isinstance(params, dict):
+                        params = {}
+                    _execute_returns_snapshot_v0(client, run_id, dag_spec, params, tenant_id)
                 else:
                     append_log(client, run_id, "Simulate work started", source="worker", meta={"step": "simulate"})
                     # Simulate work with periodic heartbeats
